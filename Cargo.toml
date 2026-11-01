@@ -33,7 +33,7 @@ futures = "0.3.34"
 # (Command Line Tools are enough). Drop it once Xcode is installed if you want
 # precompiled shaders.
 gpui = { version = "0.2.2", features = ["runtime_shaders"], optional = true }
-ignore = "=0.4.33"
+ignore = "=0.4.34"
 libc = "0.2.191"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

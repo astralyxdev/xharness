@@ -1,0 +1,98 @@
+[package]
+name = "xharness"
+version = "0.1.0"
+edition = "2024"
+description = "A native canvas for each project: terminals, editors, git and agents, on this machine or a remote server"
+repository = "https://github.com/astralyxdev/xharness"
+license-file = "LICENSE"
+publish = false
+
+# `gui` is the app. Without it (`--no-default-features`) the binary is only
+# the server: no GPUI, so it builds and runs on a machine without a display
+# (scripts/build/server.sh).
+[features]
+default = ["gui"]
+gui = [
+    "dep:gpui",
+    "dep:syntect",
+    "dep:two-face",
+    "dep:unicode-segmentation",
+    "dep:uuid",
+    "dep:block2",
+    "dep:objc2",
+    "dep:objc2-app-kit",
+    "dep:objc2-foundation",
+    "dep:resvg",
+]
+
+[dependencies]
+alacritty_terminal = "0.26.0"
+futures = "0.3.34"
+# `runtime_shaders` compiles gpui's Metal shaders when the app starts instead of
+# at build time, so building on macOS doesn't require a full Xcode install
+# (Command Line Tools are enough). Drop it once Xcode is installed if you want
+# precompiled shaders.
+gpui = { version = "0.2.2", features = ["runtime_shaders"], optional = true }
+ignore = "=0.4.33"
+libc = "0.2.191"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+# Noise for remote servers. Only the pure-Rust primitives it uses (no "std":
+# in snow 0.10 that pulls in ring, which needs a C compiler to cross-build).
+snow = { version = "0.10.0", default-features = false, features = ["default-resolver", "use-blake2", "use-chacha20poly1305", "use-curve25519", "use-getrandom"] }
+# Syntax highlighting: Sublime grammars, with bat's extra ones (TypeScript,
+# TOML, Dockerfile…). Pure-Rust regexes, so nothing to build in C.
+syntect = { version = "5.3.0", default-features = false, features = ["parsing", "dump-load", "regex-fancy"], optional = true }
+two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"], optional = true }
+unicode-segmentation = { version = "1.13.3", optional = true }
+uuid = { version = "1.29.0", features = ["v4"], optional = true }
+
+# Windows: ConPTY terminals (WezTerm's portable-pty) and AF_UNIX sockets for
+# the session host (Windows 10 and later have them).
+[target.'cfg(windows)'.dependencies]
+portable-pty = "0.9.0"
+uds_windows = "1.2.1"
+
+# Native bits GPUI doesn't expose (see src/platform/macos.rs): trackpad
+# pinches and the Dock icon. All already in gpui's dependency tree.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = { version = "0.6.2", optional = true }
+objc2 = { version = "0.6.5", optional = true }
+objc2-app-kit = { version = "0.3.2", optional = true, default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-core-foundation",
+    "NSApplication",
+    "NSButton",
+    "NSControl",
+    "NSEvent",
+    "NSImage",
+    "NSMenu",
+    "NSMenuItem",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSView",
+] }
+objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSData", "NSGeometry", "NSString"] }
+resvg = { version = "0.45.1", optional = true }
+
+# Unoptimized, gpui (layout, text, painting) and alacritty drop frames on a
+# large window, so dependencies are always built optimized; this crate stays
+# lightly optimized so it still compiles quickly.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# Release builds (scripts/build): link-time optimization across crates.
+[profile.release]
+lto = "thin"
+
+# gpui with its Windows shaders compiled at startup, so Windows builds can be
+# cross-compiled (see third_party/gpui/XHARNESS.md).
+[patch.crates-io]
+gpui = { path = "third_party/gpui" }

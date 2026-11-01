@@ -1,0 +1,154 @@
+# Builds every release package when a version tag is pushed (v0.2.0), and
+# puts them in a draft GitHub release to look over and publish.
+#
+#   1. Set `version` in Cargo.toml (and commit it, with Cargo.lock).
+#   2. git tag v<version> && git push origin v<version>
+#
+# The macOS app isn't signed or notarized yet: Gatekeeper asks before opening
+# it the first time.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::The tag is $GITHUB_REF_NAME but Cargo.toml says $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  macos:
+    name: macOS app (universal) and servers
+    needs: version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - name: App
+        run: scripts/build/macos.sh universal
+      - name: Servers
+        run: |
+          scripts/build/server.sh macos-arm64
+          scripts/build/server.sh macos-x64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos
+          path: |
+            dist/macos/*.zip
+            dist/server/*.tar.gz
+
+  linux-servers:
+    name: Linux servers (static)
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
+      - run: |
+          scripts/build/server.sh linux-x64
+          scripts/build/server.sh linux-arm64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-servers
+          path: dist/server/*.tar.gz
+
+  windows:
+    name: Windows app
+    needs: version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - run: brew install mingw-w64
+      - run: scripts/build/windows.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: dist/windows/*.zip
+
+  linux:
+    name: Linux app (${{ matrix.arch }}, experimental)
+    needs: version
+    continue-on-error: true
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - uses: dtolnay/rust-toolchain@stable
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libx11-xcb-dev libxcb1-dev libvulkan-dev libfontconfig-dev libfreetype-dev \
+            libssl-dev libzstd-dev libasound2-dev
+      - run: scripts/build/linux.sh ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/linux/*.tar.gz
+
+  release:
+    name: Draft release
+    needs: [version, macos, linux-servers, windows, linux]
+    # The Linux app is attached when it built; the rest must have.
+    if: ${{ !cancelled() && needs.macos.result == 'success' && needs.linux-servers.result == 'success' && needs.windows.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: packages
+          merge-multiple: true
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          # Artifacts keep their folders (dist/macos, dist/server…): flatten.
+          mkdir release
+          find packages -type f -exec mv {} release/ \;
+          (cd release && sha256sum * > SHA256SUMS && ls -la)
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft --verify-tag --generate-notes \
+            --title "XHarness $VERSION"

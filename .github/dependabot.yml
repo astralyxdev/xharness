@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # Rust crates: one pull request a week, minor and patch updates together.
+  # gpui is vendored (third_party/gpui) and updated by hand.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      crates:
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: gpui
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

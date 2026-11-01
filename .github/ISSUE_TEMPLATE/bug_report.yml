@@ -1,0 +1,51 @@
+name: Bug report
+description: Something doesn't work as it should
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open a project…
+        2. …
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      multiple: true
+      options:
+        - macOS (Apple silicon)
+        - macOS (Intel)
+        - Linux
+        - Windows
+    validations:
+      required: true
+  - type: dropdown
+    id: server
+    attributes:
+      label: Where the project runs
+      options:
+        - This machine's server
+        - A remote server
+        - Doesn't matter
+  - type: input
+    id: version
+    attributes:
+      label: XHarness version
+      placeholder: 0.1.0, or the commit you built
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >-
+        The end of the server's log (macOS: ~/Library/Application Support/xharness/server.log)
+        and anything the app printed. Remove keys (xhk1_…) and tokens first.
+      render: text

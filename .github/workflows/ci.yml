@@ -1,0 +1,119 @@
+# Builds and tests every push to main and every pull request.
+#
+# Required: the macOS app, the server on Linux (tests, and the static
+# x64/arm64 builds), and the Windows app (cross-built with MinGW, as
+# scripts/build/windows.sh does). Experimental, not blocking yet: the Linux
+# app and a native Windows build with its tests, which haven't passed
+# anywhere yet. Drop their `continue-on-error` once they're green.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macOS app
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        run: cargo test --locked
+
+  server:
+    name: Server (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Test (server only, no app)
+        run: cargo test --locked --no-default-features
+      - name: Build static servers
+        run: |
+          scripts/build/server.sh linux-x64
+          scripts/build/server.sh linux-arm64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: server-linux
+          path: dist/server/*.tar.gz
+          retention-days: 7
+
+  windows:
+    name: Windows app (cross-built)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install MinGW-w64
+        run: brew install mingw-w64
+      - name: Build
+        run: scripts/build/windows.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: dist/windows/*.zip
+          retention-days: 7
+
+  linux:
+    name: Linux app (experimental)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install GPUI's libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libx11-xcb-dev libxcb1-dev libvulkan-dev libfontconfig-dev libfreetype-dev \
+            libssl-dev libzstd-dev libasound2-dev
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        run: cargo test --locked
+
+  windows-native:
+    name: Windows app, native (experimental)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        run: cargo test --locked

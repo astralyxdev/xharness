@@ -1,0 +1,5 @@
+/target
+/dist
+.DS_Store
+# lino's index of this folder (local)
+/.lino/

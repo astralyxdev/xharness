@@ -1,0 +1,66 @@
+XHarness License
+
+Copyright (c) 2026 Astralyx. All rights reserved.
+
+XHarness (the "Software": the source code in this repository, its
+documentation, and builds made from it) is published so that people can read
+it and contribute changes to it. This is not an open-source license: you may
+not copy the Software or reuse it elsewhere. Everything this license doesn't
+expressly permit is reserved by Astralyx.
+
+1. What you may do
+
+   a. Read the Software, on GitHub or in a copy you downloaded under (b).
+   b. Fork this repository on GitHub, download it, and build and run it on
+      your own machines, only to try it out and to develop and test changes
+      you will submit under (c).
+   c. Submit changes ("Contributions") to Astralyx, for example as pull
+      requests to https://github.com/astralyxdev/xharness.
+   d. Install and use official builds of XHarness that Astralyx publishes.
+
+2. What you may not do
+
+   Unless Astralyx permits it in writing, you may not:
+
+   a. copy the Software or any part of it (code, assets, designs) into other
+      software, products, repositories or publications, except a fork kept
+      for (1)(b) and (1)(c);
+   b. distribute, publish, sell, rent, lend or sublicense the Software,
+      changed or not, as source or as builds;
+   c. publish or distribute a changed version of the Software, or offer the
+      Software or a changed version as a service for others;
+   d. remove or change this license or any copyright notice.
+
+3. Contributions
+
+   By submitting a Contribution, you confirm that you have the right to
+   submit it, and you grant Astralyx a perpetual, worldwide, non-exclusive,
+   royalty-free, irrevocable license to use, copy, change, distribute,
+   sublicense and relicense it, as part of the Software or otherwise. Once
+   accepted, a Contribution is part of the Software under this license.
+
+4. Third-party components
+
+   Some parts of the repository and of the builds belong to others and stay
+   under their own licenses, which this license doesn't change: see
+   THIRD_PARTY.md. lino, which builds bundle, is Astralyx's and is licensed
+   separately under the MIT License (https://github.com/astralyxdev/lino).
+
+5. Ending
+
+   If you break these terms, your permissions under this license end
+   automatically, and you must delete your copies of the Software (other
+   than official builds you installed under (1)(d)).
+
+6. No warranty
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+   ASTRALYX OR ITS CONTRIBUTORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+   FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+   DEALINGS IN THE SOFTWARE.
+
+For permission beyond this license, open an issue at
+https://github.com/astralyxdev/xharness or contact Astralyx.

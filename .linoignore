@@ -1,0 +1,22 @@
+# created by lino; same syntax as .gitignore
+.git/
+node_modules/
+.venv/
+venv/
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+.tox/
+target/
+dist/
+build/
+.next/
+.nuxt/
+.cache/
+coverage/
+.idea/
+.vscode/
+.DS_Store
+*.min.js
+*.min.css
+*.map

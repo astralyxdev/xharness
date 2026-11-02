@@ -15,8 +15,9 @@ pub type Writer = Box<dyn Write + Send>;
 
 /// The running shell. Dropping it ends the shell.
 pub struct ShellPty {
+    /// Dropped by hand, see `Drop`.
     #[cfg(unix)]
-    pty: alacritty_terminal::tty::Pty,
+    pty: std::mem::ManuallyDrop<alacritty_terminal::tty::Pty>,
     #[cfg(windows)]
     master: std::sync::Arc<std::sync::Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>>,
     #[cfg(windows)]
@@ -35,7 +36,7 @@ impl ShellPty {
         // host reads it with a plain blocking thread instead.
         set_blocking(&output)?;
         let input = pty.file().try_clone()?;
-        Ok((Self { pty }, Box::new(output), Box::new(input)))
+        Ok((Self { pty: std::mem::ManuallyDrop::new(pty) }, Box::new(output), Box::new(input)))
     }
 
     #[cfg(unix)]
@@ -86,6 +87,53 @@ impl ShellPty {
         if let Some(master) = self.master.lock().unwrap().as_ref() {
             master.resize(pty_size(size)).ok();
         }
+    }
+}
+
+/// alacritty's PTY hangs up on the shell (SIGHUP) and waits for it to exit
+/// when dropped. A shell can miss that: bash notes a SIGHUP that arrives
+/// between commands but acts on it only when its next read of the terminal
+/// returns, and with the host still holding the terminal open, that read
+/// waits for typing that never comes. So the shell gets a moment to exit,
+/// and then SIGKILL.
+#[cfg(unix)]
+impl Drop for ShellPty {
+    fn drop(&mut self) {
+        let pid = self.pty.child().id() as libc::pid_t;
+        // SAFETY: a signal to our own child, which isn't reaped until the
+        // PTY below is dropped, so the pid can't belong to anyone else.
+        unsafe { libc::kill(pid, libc::SIGHUP) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !has_exited(pid) {
+            if std::time::Instant::now() >= deadline {
+                // SAFETY: as above.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // SAFETY: dropped once, here, and never used again.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.pty) };
+    }
+}
+
+/// Whether our child `pid` has exited, leaving it to be reaped.
+#[cfg(unix)]
+fn has_exited(pid: libc::pid_t) -> bool {
+    // SAFETY: waitid only writes `info`. WNOWAIT leaves the child as it is.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let options = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+        if libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, options) != 0 {
+            // Not a child to wait for (any more): nothing to wait for.
+            return true;
+        }
+        // With WNOHANG, a child still running leaves `info` zeroed.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let exited = info.si_pid() != 0;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let exited = info.si_pid != 0;
+        exited
     }
 }
 

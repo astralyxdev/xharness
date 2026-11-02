@@ -290,7 +290,9 @@ pub fn kill(address: &HostAddress, session: &str) {
     };
     if let Ok(payload) = serde_json::to_vec(&hello) {
         write_frame(&mut stream, frame::HELLO, &payload).ok();
-        // Wait for the host to hang up, so the kill is done when we return.
+        // Wait for the host to hang up, so the kill is done when we return;
+        // not for ever (the app calls this while deleting a project).
+        stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
         let mut rest = Vec::new();
         stream.read_to_end(&mut rest).ok();
     }
@@ -958,6 +960,28 @@ pub mod tests {
         let show = shell_command("echo state-[$XH_STATE]\r", "echo \"state-[$env:XH_STATE]\"\r");
         write_frame(&mut stream, frame::INPUT, show).unwrap();
         read_until(&mut stream, "state-[]");
+    }
+
+    /// A shell that ignores the hangup (as bash does when it arrives at the
+    /// wrong moment) still ends, and killing doesn't hang.
+    #[cfg(unix)]
+    #[test]
+    fn killing_ends_a_shell_that_ignores_hangups() {
+        let address = start_test_host("stubborn");
+        let (mut stream, _) = attach(&address, &hello("stubborn", None)).unwrap();
+        write_frame(&mut stream, frame::INPUT, b"trap '' HUP; echo ready-$((1+1))\r").unwrap();
+        read_until(&mut stream, "ready-2");
+        drop(stream);
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let killing = address.clone();
+        thread::spawn(move || {
+            kill(&killing, "stubborn");
+            done.send(()).ok();
+        });
+        finished.recv_timeout(Duration::from_secs(8)).expect("kill returns once the shell is gone");
+        let (_, attached) = attach(&address, &hello("stubborn", None)).unwrap();
+        assert!(attached.created, "the old shell is gone");
     }
 
     #[test]

@@ -114,6 +114,14 @@ impl Stream {
             Stream::Remote(stream) => stream.raw.shutdown(how),
         }
     }
+
+    /// How long a read waits before failing (`None`: for ever).
+    pub fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        match self {
+            Stream::Local(stream) => stream.set_read_timeout(timeout),
+            Stream::Remote(stream) => stream.raw.set_read_timeout(timeout),
+        }
+    }
 }
 
 impl Read for Stream {

@@ -3,3 +3,5 @@
 .DS_Store
 # lino's index of this folder (local)
 /.lino/
+# Internal product notes, not for the repository
+/PRODUCT.md

@@ -376,22 +376,91 @@ impl Lsp {
     }
 }
 
-/// `file:///Users/me/a%20b.rs` for `/Users/me/a b.rs`.
-pub fn path_to_uri(path: &Path) -> String {
-    let mut uri = String::from("file://");
-    for byte in path.to_string_lossy().bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => uri.push(byte as char),
-            _ => uri.push_str(&format!("%{byte:02X}")),
+/// The path to open files under: absolute, with links resolved, so it
+/// matches the paths servers report back. On Windows without the `\\?\`
+/// prefix `canonicalize` adds, which servers never use.
+pub fn canonical(path: &Path) -> PathBuf {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if cfg!(windows) {
+        let text = path.to_string_lossy();
+        if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{share}"));
+        }
+        if let Some(local) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(local);
         }
     }
-    uri
+    path
 }
 
+/// `file:///Users/me/a%20b.rs` for `/Users/me/a b.rs`; on Windows
+/// `file:///C:/src/main.rs` for `C:\src\main.rs` and
+/// `file://server/share/a.rs` for `\\server\share\a.rs`.
+pub fn path_to_uri(path: &Path) -> String {
+    file_uri(&path.to_string_lossy(), cfg!(windows))
+}
+
+/// The local path a `file://` URI names (see [`path_to_uri`]).
 pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
-    let encoded = uri.strip_prefix("file://")?;
-    let mut bytes = Vec::with_capacity(encoded.len());
-    let mut iter = encoded.bytes();
+    uri_path(uri, cfg!(windows)).map(PathBuf::from)
+}
+
+fn file_uri(path: &str, windows: bool) -> String {
+    if !windows {
+        return format!("file://{}", percent_encode(path));
+    }
+    let path = path.replace('\\', "/");
+    // Verbatim paths, as `canonicalize` gives them: \\?\C:\… and \\?\UNC\server\….
+    let path = match (path.strip_prefix("//?/UNC/"), path.strip_prefix("//?/")) {
+        (Some(share), _) => format!("//{share}"),
+        (None, Some(local)) => local.to_string(),
+        (None, None) => path,
+    };
+    match path.strip_prefix("//") {
+        // A share: the server goes where a URI's host does.
+        Some(share) => {
+            let (host, rest) = share.split_once('/').unwrap_or((share, ""));
+            format!("file://{}/{}", percent_encode(host), percent_encode(rest))
+        }
+        None if path.starts_with('/') => format!("file://{}", percent_encode(&path)),
+        None => format!("file:///{}", percent_encode(&path)),
+    }
+}
+
+fn uri_path(uri: &str, windows: bool) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let (host, path) = (percent_decode(host)?, percent_decode(path)?);
+    if !windows {
+        return Some(path);
+    }
+    let path = path.replace('/', "\\");
+    let bytes = path.as_bytes();
+    // \C:\… (servers write the drive either case, and some as `c%3A`).
+    if bytes.len() >= 3 && bytes[0] == b'\\' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+        return Some(format!("{}{}", bytes[1].to_ascii_uppercase() as char, &path[2..]));
+    }
+    if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
+        return Some(format!(r"\\{host}{path}"));
+    }
+    Some(path)
+}
+
+/// Everything but letters, digits and `/-_.~:` as `%XX`, byte by byte.
+fn percent_encode(text: &str) -> String {
+    let mut encoded = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' | b':' => encoded.push(byte as char),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn percent_decode(text: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(text.len());
+    let mut iter = text.bytes();
     while let Some(byte) = iter.next() {
         if byte == b'%' {
             let hex = [iter.next()?, iter.next()?];
@@ -400,15 +469,15 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
             bytes.push(byte);
         }
     }
-    Some(PathBuf::from(String::from_utf8(bytes).ok()?))
+    String::from_utf8(bytes).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A real server (clangd, from Xcode's tools) answers and reports an
-    /// error in a file we open.
+    /// A real server (clangd, from Xcode's tools or LLVM) answers and
+    /// reports an error in a file we open.
     #[test]
     fn clangd_reports_an_error() {
         let Some(clangd) = language_servers::find_command("clangd") else {
@@ -417,38 +486,54 @@ mod tests {
         let root = std::env::temp_dir().join(format!("xh-lsp-{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = canonical(&root);
         let file = root.join("main.c");
         let text = "int main(void) { return missing; }\n";
         std::fs::write(&file, text).unwrap();
 
         let (client, mut notifications) = Client::spawn("clangd", &clangd, &[], &root).unwrap();
-        futures::executor::block_on(async {
-            client.clone().initialize(root.clone()).await.unwrap();
-            client.notify(
-                "textDocument/didOpen",
-                json!({ "textDocument": { "uri": path_to_uri(&file), "languageId": "c", "version": 1, "text": text } }),
-            );
-            loop {
-                let message = notifications.next().await.expect("clangd keeps running");
-                if message["method"] == "textDocument/publishDiagnostics" {
-                    let diagnostics = message["params"]["diagnostics"].as_array().unwrap();
-                    assert!(
-                        diagnostics.iter().any(|d| d["message"].as_str().unwrap().contains("missing")),
-                        "{diagnostics:?}"
+        // A server that never answers fails the test instead of hanging it.
+        let (done, finished) = std::sync::mpsc::channel();
+        let talking = client.clone();
+        let uri = path_to_uri(&file);
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                futures::executor::block_on(async {
+                    talking.clone().initialize(root.clone()).await.unwrap();
+                    talking.notify(
+                        "textDocument/didOpen",
+                        json!({ "textDocument": { "uri": uri, "languageId": "c", "version": 1, "text": text } }),
                     );
-                    break;
-                }
-            }
-            // Requests get replies too.
-            let hover = client
-                .request("textDocument/hover", json!({ "textDocument": { "uri": path_to_uri(&file) }, "position": { "line": 0, "character": 4 } }))
-                .await
-                .unwrap();
-            assert!(hover.is_ok());
+                    loop {
+                        let message = notifications.next().await.expect("clangd keeps running");
+                        if message["method"] == "textDocument/publishDiagnostics" {
+                            assert_eq!(message["params"]["uri"], uri.as_str());
+                            let diagnostics = message["params"]["diagnostics"].as_array().unwrap();
+                            assert!(
+                                diagnostics.iter().any(|d| d["message"].as_str().unwrap().contains("missing")),
+                                "{diagnostics:?}"
+                            );
+                            break;
+                        }
+                    }
+                    // Requests get replies too.
+                    let hover = talking
+                        .request("textDocument/hover", json!({ "textDocument": { "uri": uri }, "position": { "line": 0, "character": 4 } }))
+                        .await
+                        .unwrap();
+                    assert!(hover.is_ok());
+                })
+            }));
+            done.send(result).ok();
         });
+        let result = finished
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("clangd didn't report diagnostics within a minute");
         drop(client);
-        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(std::env::temp_dir().join(format!("xh-lsp-{}", std::process::id()))).ok();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[test]
@@ -458,5 +543,21 @@ mod tests {
         assert_eq!(uri, "file:///Users/me/my%20project/main.rs");
         assert_eq!(uri_to_path(&uri).as_deref(), Some(path));
         assert_eq!(uri_to_path("file:///tmp/%C3%A9.txt").unwrap(), PathBuf::from("/tmp/é.txt"));
+    }
+
+    /// Windows paths, whichever platform the tests run on.
+    #[test]
+    fn windows_paths_are_uris_with_a_drive_or_a_host() {
+        let uri = |path| file_uri(path, true);
+        let path = |uri| uri_path(uri, true).unwrap();
+        assert_eq!(uri(r"C:\Users\me\my project\main.rs"), "file:///C:/Users/me/my%20project/main.rs");
+        assert_eq!(uri(r"\\?\D:\a\main.c"), "file:///D:/a/main.c");
+        assert_eq!(uri(r"\\server\share\a.rs"), "file://server/share/a.rs");
+        assert_eq!(uri(r"\\?\UNC\server\share\a.rs"), "file://server/share/a.rs");
+        assert_eq!(path("file:///C:/Users/me/my%20project/main.rs"), r"C:\Users\me\my project\main.rs");
+        // Servers write the drive in either case, and some escape the colon.
+        assert_eq!(path("file:///d%3A/a/main.c"), r"D:\a\main.c");
+        assert_eq!(path("file://server/share/a.rs"), r"\\server\share\a.rs");
+        assert_eq!(path("file://localhost/C:/a.rs"), r"C:\a.rs");
     }
 }

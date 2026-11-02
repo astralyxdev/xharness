@@ -820,6 +820,14 @@ pub mod tests {
         HostAddress::Remote(key)
     }
 
+    /// A command for the shell sessions run: zsh (bash where there's no
+    /// zsh; these work in both), or PowerShell on Windows.
+    /// Tests wait for output only the command's result contains (`$((1+1))`
+    /// prints `2`), not the typed line the shell echoes back.
+    pub fn shell_command(zsh: &'static str, powershell: &'static str) -> &'static [u8] {
+        if cfg!(windows) { powershell.as_bytes() } else { zsh.as_bytes() }
+    }
+
     fn hello(session: &str, folder: Option<PathBuf>) -> Hello {
         Hello {
             protocol: PROTOCOL,
@@ -881,18 +889,20 @@ pub mod tests {
 
         let (mut first, attached) = attach(&address, &hello("keep", None)).unwrap();
         assert!(attached.created);
-        write_frame(&mut first, frame::INPUT, b"export XH_STATE=kept-$((6*7))\r").unwrap();
-        write_frame(&mut first, frame::INPUT, b"echo marker-one\r").unwrap();
-        read_until(&mut first, "marker-one\r\n");
+        let set = shell_command("export XH_STATE=kept-$((6*7))\r", "$env:XH_STATE = \"kept-$(6*7)\"\r");
+        write_frame(&mut first, frame::INPUT, set).unwrap();
+        write_frame(&mut first, frame::INPUT, shell_command("echo marker-$((1+1))\r", "echo \"marker-$(1+1)\"\r")).unwrap();
+        read_until(&mut first, "marker-2");
         drop(first); // The app quits.
 
         let (mut second, attached) = attach(&address, &hello("keep", None)).unwrap();
         assert!(!attached.created, "the same session comes back");
         // The replay has the earlier output...
-        let replay = read_until(&mut second, "marker-one");
-        assert!(replay.contains("export XH_STATE"));
+        let replay = read_until(&mut second, "marker-2");
+        assert!(replay.contains("XH_STATE"));
         // ...and it's the same shell: the variable is still set.
-        write_frame(&mut second, frame::INPUT, b"echo state-$XH_STATE\r").unwrap();
+        let show = shell_command("echo state-$XH_STATE\r", "echo \"state-$env:XH_STATE\"\r");
+        write_frame(&mut second, frame::INPUT, show).unwrap();
         read_until(&mut second, "state-kept-42");
     }
 
@@ -900,15 +910,16 @@ pub mod tests {
     fn killing_ends_the_session() {
         let address = start_test_host("kill");
         let (mut stream, _) = attach(&address, &hello("doomed", None)).unwrap();
-        write_frame(&mut stream, frame::INPUT, b"export XH_STATE=old\r").unwrap();
-        write_frame(&mut stream, frame::INPUT, b"echo ready\r").unwrap();
-        read_until(&mut stream, "ready\r\n");
+        write_frame(&mut stream, frame::INPUT, shell_command("export XH_STATE=old\r", "$env:XH_STATE = \"old\"\r")).unwrap();
+        write_frame(&mut stream, frame::INPUT, shell_command("echo ready-$((1+1))\r", "echo \"ready-$(1+1)\"\r")).unwrap();
+        read_until(&mut stream, "ready-2");
         drop(stream);
 
         kill(&address, "doomed");
         let (mut stream, attached) = attach(&address, &hello("doomed", None)).unwrap();
         assert!(attached.created, "a new shell, not the killed one");
-        write_frame(&mut stream, frame::INPUT, b"echo state-[$XH_STATE]\r").unwrap();
+        let show = shell_command("echo state-[$XH_STATE]\r", "echo \"state-[$env:XH_STATE]\"\r");
+        write_frame(&mut stream, frame::INPUT, show).unwrap();
         read_until(&mut stream, "state-[]");
     }
 
@@ -918,7 +929,8 @@ pub mod tests {
         let folder = std::env::temp_dir().join(format!("xh-folder-{}", std::process::id()));
         std::fs::create_dir_all(&folder).unwrap();
         let (mut stream, _) = attach(&address, &hello("here", Some(folder.clone()))).unwrap();
-        write_frame(&mut stream, frame::INPUT, b"echo in-$(basename \"$PWD\")\r").unwrap();
+        let show = shell_command("echo in-$(basename \"$PWD\")\r", "echo \"in-$(Split-Path -Leaf $PWD)\"\r");
+        write_frame(&mut stream, frame::INPUT, show).unwrap();
         read_until(&mut stream, &format!("in-{}", folder.file_name().unwrap().to_string_lossy()));
     }
 
@@ -926,6 +938,9 @@ pub mod tests {
     fn an_exiting_shell_reports_it() {
         let address = start_test_host("exit");
         let (mut stream, _) = attach(&address, &hello("brief", None)).unwrap();
+        // Once it's reading input, so the exit isn't typed ahead of startup.
+        write_frame(&mut stream, frame::INPUT, shell_command("echo ready-$((1+1))\r", "echo \"ready-$(1+1)\"\r")).unwrap();
+        let mut output = read_until(&mut stream, "ready-2");
         write_frame(&mut stream, frame::INPUT, b"exit\r").unwrap();
         if let Stream::Local(local) = &stream {
             local.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
@@ -933,8 +948,9 @@ pub mod tests {
         loop {
             match read_frame(&mut stream) {
                 Ok((frame::EXITED, _)) => break,
+                Ok((frame::OUTPUT, bytes)) => output.push_str(&String::from_utf8_lossy(&bytes)),
                 Ok(_) => {}
-                Err(error) => panic!("no EXITED frame: {error}"),
+                Err(error) => panic!("no EXITED frame: {error}; output was:\n{output}"),
             }
         }
     }

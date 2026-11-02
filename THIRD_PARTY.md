@@ -8,6 +8,7 @@ someone else's (or licensed separately) and keep their own licenses.
 | What | Where | License |
 | --- | --- | --- |
 | [GPUI](https://github.com/zed-industries/zed) 0.2.2, by Zed Industries, with XHarness's changes listed in `third_party/gpui/XHARNESS.md` | `third_party/gpui/` | Apache-2.0 (`third_party/gpui/LICENSE-APACHE`) |
+| [xattr](https://github.com/Stebalien/xattr) 0.2.3, by Steven Allen, with the fix in `third_party/xattr/XHARNESS.md` | `third_party/xattr/` | MIT or Apache-2.0 (`third_party/xattr/LICENSE-MIT`, `LICENSE-APACHE`) |
 | [Lucide](https://lucide.dev) icons | `assets/icons/*.svg` (all but `github.svg`) | ISC |
 | GitHub's mark, from [Octicons](https://github.com/primer/octicons) | `assets/icons/github.svg` | MIT; the mark is GitHub's trademark, used to link to GitHub |
 

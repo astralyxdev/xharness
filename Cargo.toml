@@ -93,6 +93,8 @@ opt-level = 3
 lto = "thin"
 
 # gpui with its Windows shaders compiled at startup, so Windows builds can be
-# cross-compiled (see third_party/gpui/XHARNESS.md).
+# cross-compiled (see third_party/gpui/XHARNESS.md), and xattr fixed for
+# current libc on Linux (third_party/xattr/XHARNESS.md).
 [patch.crates-io]
 gpui = { path = "third_party/gpui" }
+xattr = { path = "third_party/xattr" }

@@ -25,7 +25,6 @@ use file::*;
 use text::*;
 
 use std::{
-    fs,
     ops::Range,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -427,7 +426,7 @@ impl EditorView {
         if self._lsp.is_none() {
             self._lsp = Some(cx.observe(&store, |this, store, cx| this.lsp_changed(store, cx)));
         }
-        let path = fs::canonicalize(&self.path).unwrap_or_else(|_| self.path.clone());
+        let path = lsp::canonical(&self.path);
         cx.spawn(async move |this, cx| {
             let found = cx
                 .background_executor()

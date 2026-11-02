@@ -1357,6 +1357,8 @@ mod tests {
 
     use alacritty_terminal::index::{Column as GridColumn, Line};
 
+    use crate::services::server::tests::shell_command;
+
     #[test]
     fn dropped_paths_are_quoted_for_the_shell() {
         assert_eq!(super::shell_quote("/tmp/a.txt"), "/tmp/a.txt");
@@ -1515,19 +1517,23 @@ mod tests {
             Session::attach("terminal-test", Some(folder.clone()), &host).expect("shell starts");
         let name = folder.file_name().unwrap().to_string_lossy().to_string();
 
-        // Our own startup files run, not yours: our prompt, and no oh-my-zsh
-        // (its `omz` command would exist if ~/.zshrc had loaded).
+        // Our own startup files run, not yours: our prompt, and (with zsh;
+        // Linux without it gets bash) no oh-my-zsh, whose `omz` command
+        // would exist if ~/.zshrc had loaded.
+        let prompt = if cfg!(windows) { format!("{name} >") } else { format!("{name} ❯") };
         assert!(
-            wait_for(&session, &format!("{name} ❯")),
+            wait_for(&session, &prompt),
             "not our prompt; screen was:\n{}",
             screen(&session.term.lock())
         );
-        session.write(b"echo omz-$(whence -w omz)\r".to_vec());
-        assert!(
-            wait_for(&session, "omz-omz: none"),
-            "your ~/.zshrc loaded; screen was:\n{}",
-            screen(&session.term.lock())
-        );
+        if cfg!(unix) && std::path::Path::new("/bin/zsh").exists() {
+            session.write(b"echo omz-$(whence -w omz)\r".to_vec());
+            assert!(
+                wait_for(&session, "omz-omz: none"),
+                "your ~/.zshrc loaded; screen was:\n{}",
+                screen(&session.term.lock())
+            );
+        }
         // The prompt reports the folder as the window title.
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut titled = false;
@@ -1539,7 +1545,7 @@ mod tests {
         }
         assert!(titled, "no folder title");
 
-        session.write(b"echo in-$(basename \"$PWD\")\r".to_vec());
+        session.write(shell_command("echo in-$(basename \"$PWD\")\r", "echo \"in-$(Split-Path -Leaf $PWD)\"\r").to_vec());
         let expected = format!("in-{}", folder.file_name().unwrap().to_string_lossy());
         assert!(
             wait_for(&session, &expected),
@@ -1548,14 +1554,15 @@ mod tests {
         );
 
         // The arithmetic only appears in the output if the shell ran it.
-        session.write(b"echo xharness-$((40 + 2))\r".to_vec());
+        session.write(shell_command("echo xharness-$((40 + 2))\r", "echo \"xharness-$(40 + 2)\"\r").to_vec());
         assert!(
             wait_for(&session, "xharness-42"),
             "no output; screen was:\n{}",
             screen(&session.term.lock())
         );
 
-        // A resize reaches the shell (TIOCSWINSZ), not just the grid.
+        // A resize reaches the shell (TIOCSWINSZ, or ConPTY's resize), not
+        // just the grid.
         session.resize(
             GridSize {
                 columns: 101,
@@ -1563,7 +1570,13 @@ mod tests {
             },
             size(px(8.), px(17.)),
         );
-        session.write(b"echo size-$(tput cols)x$(tput lines)\r".to_vec());
+        session.write(
+            shell_command(
+                "echo size-$(tput cols)x$(tput lines)\r",
+                "echo \"size-$($Host.UI.RawUI.WindowSize.Width)x$($Host.UI.RawUI.WindowSize.Height)\"\r",
+            )
+            .to_vec(),
+        );
         assert!(
             wait_for(&session, "size-101x31"),
             "resize not seen; screen was:\n{}",

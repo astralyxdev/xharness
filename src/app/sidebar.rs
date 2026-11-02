@@ -69,26 +69,20 @@ impl AppShell {
                                 ui::sidebar_menu_button(
                                     ElementId::named_usize("nav", page as usize),
                                     page.icon(),
-                                    page.label(),
+                                    crate::i18n::t(page.label()),
                                     self.selection == Selection::Page(page),
                                     false,
                                     None,
                                     theme,
                                 )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.selection = Selection::Page(page);
-                                    if page == Page::Marketplace {
-                                        this.marketplace.update(cx, |m, cx| m.refresh(cx));
-                                    }
-                                    cx.notify();
-                                }))
+                                .on_click(cx.listener(move |this, _, _, cx| this.show_page(page, cx)))
                             },
                         )),
                     )
                     .when(!pinned.is_empty(), |content| {
-                        content.child(self.render_project_group("Pinned", &pinned, false, theme, cx))
+                        content.child(self.render_project_group(crate::i18n::t("Pinned"), &pinned, false, theme, cx))
                     })
-                    .child(self.render_project_group("Projects", &unpinned, true, theme, cx)),
+                    .child(self.render_project_group(crate::i18n::t("Projects"), &unpinned, true, theme, cx)),
             )
             .into_any_element()
     }
@@ -233,9 +227,11 @@ impl AppShell {
                         menu_open,
                         theme,
                     )
+                    .child(self.anchors.track(format!("project-actions-{id}")))
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         cx.stop_propagation();
-                        this.open_project_menu(id, event.position(), window, cx);
+                        let at = this.anchors.below(&format!("project-actions-{id}"), ui::Align::Start, event.position());
+                        this.open_project_menu(id, at, window, cx);
                     })),
                 )
                 .child(
@@ -297,8 +293,10 @@ impl AppShell {
                         theme,
                     )
                     .when(new_window_menu, |row| row.bg(fg.opacity(0.1)))
+                    .child(self.anchors.track(format!("new-window-{id}")))
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                        this.open_new_window_menu(id, event.position(), window, cx)
+                        let at = this.anchors.below(&format!("new-window-{id}"), ui::Align::Start, event.position());
+                        this.open_new_window_menu(id, at, window, cx)
                     })),
                 )
             })

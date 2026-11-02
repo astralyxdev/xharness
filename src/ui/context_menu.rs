@@ -19,6 +19,22 @@ use crate::ui;
 
 const KEY_CONTEXT: &str = "ContextMenu";
 
+/// Where a menu opens: a point, and which of the menu's corners sits on it.
+/// A right-click menu opens down-right from the pointer (a plain point
+/// converts to that); a dropdown opens against its button (see
+/// [`ui::Anchors`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MenuAt {
+    pub point: gpui::Point<gpui::Pixels>,
+    pub corner: gpui::Corner,
+}
+
+impl From<gpui::Point<gpui::Pixels>> for MenuAt {
+    fn from(point: gpui::Point<gpui::Pixels>) -> Self {
+        MenuAt { point, corner: gpui::Corner::TopLeft }
+    }
+}
+
 pub fn bind_keys(cx: &mut App) {
     let context = Some(KEY_CONTEXT);
     cx.bind_keys([
@@ -41,6 +57,13 @@ pub enum MenuEntry {
         handler: Handler,
     },
     Separator,
+    /// A heading that isn't picked: a title, a line under it, and
+    /// optionally an avatar's initials and color (the profile menu).
+    Header {
+        title: SharedString,
+        subtitle: SharedString,
+        avatar: Option<(SharedString, gpui::Hsla)>,
+    },
 }
 
 impl MenuEntry {
@@ -179,6 +202,12 @@ impl Render for ContextMenu {
             .border_color(theme.border)
             .bg(theme.popover)
             .text_color(theme.popover_foreground)
+            .shadow(vec![gpui::BoxShadow {
+                color: gpui::black().opacity(0.16),
+                offset: gpui::point(px(0.), px(8.)),
+                blur_radius: px(24.),
+                spread_radius: px(-6.),
+            }])
             .children(self.entries.iter().enumerate().map(|(ix, entry)| {
                 match entry {
                     // bg-border -mx-1 my-1 h-px
@@ -187,6 +216,38 @@ impl Render for ContextMenu {
                         .my_1()
                         .mx(px(-4.))
                         .bg(theme.border)
+                        .into_any_element(),
+                    MenuEntry::Header { title, subtitle, avatar } => div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .px(px(10.))
+                        .py(px(8.))
+                        .children(avatar.as_ref().map(|(initials, color)| ui::avatar(initials.clone(), *color, 32.)))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .text_size(px(14.))
+                                        .line_height(px(20.))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .truncate()
+                                        .child(title.clone()),
+                                )
+                                .when(!subtitle.is_empty(), |el| {
+                                    el.child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .line_height(px(16.))
+                                            .text_color(theme.muted_foreground)
+                                            .truncate()
+                                            .child(subtitle.clone()),
+                                    )
+                                }),
+                        )
                         .into_any_element(),
                     MenuEntry::Item {
                         icon,

@@ -686,6 +686,27 @@ pub struct Path<P: Clone + Debug + Default + PartialEq> {
 }
 
 impl Path<Pixels> {
+    /// (XHarness) The path as drawn under `transform` (see `Window::with_zoom`).
+    pub(crate) fn transformed(self, transform: &crate::ElementTransform) -> Self {
+        Path {
+            bounds: transform.apply_bounds(self.bounds),
+            vertices: self
+                .vertices
+                .into_iter()
+                .map(|vertex| PathVertex {
+                    xy_position: transform.apply(vertex.xy_position),
+                    st_position: vertex.st_position,
+                    content_mask: ContentMask {
+                        bounds: transform.apply_bounds(vertex.content_mask.bounds),
+                    },
+                })
+                .collect(),
+            start: transform.apply(self.start),
+            current: transform.apply(self.current),
+            ..self
+        }
+    }
+
     /// Create a new path with the given starting point.
     pub fn new(start: Point<Pixels>) -> Self {
         Self {

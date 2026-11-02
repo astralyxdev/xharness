@@ -9,6 +9,7 @@ use gpui::{
     prelude::*, px,
 };
 
+use crate::i18n::t;
 use crate::ui::actions::Cancel;
 use crate::ui::theme::Theme;
 use crate::ui::{self, Button, Variant};
@@ -83,7 +84,7 @@ impl Render for AlertDialog {
                 .child(
                     ui::dialog_footer(theme)
                         .child(
-                            Button::new("alert-cancel", "Cancel")
+                            Button::new("alert-cancel", t("Cancel"))
                                 .variant(Variant::Soft)
                                 .on_click(cx.listener(|_, _, _, cx| {
                                     cx.emit(AlertDialogEvent::Cancel)

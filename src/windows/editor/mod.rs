@@ -41,6 +41,7 @@ use gpui::{
 use serde_json::{Value, json};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::i18n::{t, tf, tn};
 use crate::ui::assets::IconName;
 use crate::windows::explorer::open_with_default_app;
 use crate::services::lsp::{self, Attached, Lsp};
@@ -712,8 +713,8 @@ impl EditorView {
         if !matches!(self.doc, Doc::Ready) {
             return None;
         }
-        let language = self.syntax.as_ref().map_or("Plain Text", |h| h.language.name());
-        Some(if self.dirty() { format!("{language} · unsaved") } else { language.to_string() })
+        let language = self.syntax.as_ref().map_or(t("Plain Text"), |h| h.language.name());
+        Some(if self.dirty() { tf("{} · unsaved", &[&language]) } else { language.to_string() })
     }
 
     fn state_id(&self) -> u64 {
@@ -781,7 +782,7 @@ impl EditorView {
                     attached.client.notify("textDocument/didSave", json!({ "textDocument": { "uri": self.lsp_uri } }));
                 }
             }
-            Err(error) => self.error = Some(format!("Couldn't save: {error}.")),
+            Err(error) => self.error = Some(tf("Couldn't save: {}.", &[&error])),
         }
         cx.notify();
     }
@@ -1667,13 +1668,13 @@ impl EditorView {
         } else {
             match self.conflict? {
                 Conflict::Changed => (
-                    "This file changed on disk.".to_string(),
+                    t("This file changed on disk.").to_string(),
                     theme.tints.amber,
                     vec![
-                        ui::compact_button("editor-reload", Some(IconName::RefreshCw), "Reload", false, theme)
+                        ui::compact_button("editor-reload", Some(IconName::RefreshCw), t("Reload"), false, theme)
                             .on_click(cx.listener(|this, _, _, cx| this.reload(cx)))
                             .into_any_element(),
-                        ui::compact_button("editor-keep", None, "Keep mine", false, theme)
+                        ui::compact_button("editor-keep", None, t("Keep mine"), false, theme)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 // Saving overwrites the disk's version.
                                 this.disk = crate::services::rpc::on(this.server.as_ref(), || stamp_of(&this.path));
@@ -1684,7 +1685,7 @@ impl EditorView {
                     ],
                 ),
                 Conflict::Deleted => (
-                    "This file was deleted. Saving creates it again.".to_string(),
+                    t("This file was deleted. Saving creates it again.").to_string(),
                     theme.tints.amber,
                     Vec::new(),
                 ),
@@ -1715,19 +1716,24 @@ impl EditorView {
             String::new()
         } else {
             let text = self.buffer.slice(self.selection.range());
-            format!(" ({} selected)", text.chars().count())
+            tf(" ({} selected)", &[&text.chars().count()])
         };
-        let language = self.syntax.as_ref().map_or("Plain Text", |h| h.language.name());
+        let language = self.syntax.as_ref().map_or(t("Plain Text"), |h| h.language.name());
         let count = |severity: u8| self.diagnostics.iter().filter(|d| d.severity == severity).count();
         let server = self.lsp.as_ref().map(|attached| {
             let (errors, warnings) = (count(1), count(2));
             match (errors, warnings) {
                 (0, 0) => attached.client.name.to_string(),
-                _ => format!("{} · {errors} errors, {warnings} warnings", attached.client.name),
+                _ => format!(
+                    "{} · {}, {}",
+                    attached.client.name,
+                    tn(errors, "{} error", "{} errors"),
+                    tn(warnings, "{} warning", "{} warnings")
+                ),
             }
         });
         let items = [
-            format!("Ln {}, Col {column}{selected}", head.line + 1),
+            format!("{}{selected}", tf("Ln {}, Col {}", &[&(head.line + 1), &column])),
             server.unwrap_or_default(),
             self.indent.label(),
             if self.crlf { "CRLF" } else { "LF" }.to_string(),
@@ -1837,7 +1843,7 @@ impl Render for EditorView {
                     .justify_center()
                     .text_size(rems(0.8125))
                     .text_color(theme.muted_foreground)
-                    .child("Opening…"),
+                    .child(t("Opening…")),
             ),
             Doc::Failed(error) => {
                 let path = self.path.clone();
@@ -1855,7 +1861,7 @@ impl Render for EditorView {
                         .child(div().text_color(theme.muted_foreground).child(error.clone()))
                         .when(self.server.is_none() && self.path.exists(), |el| {
                             el.child(
-                                ui::compact_button("editor-open-external", Some(IconName::ExternalLink), "Open with default app", false, theme)
+                                ui::compact_button("editor-open-external", Some(IconName::ExternalLink), t("Open with default app"), false, theme)
                                     .on_click(move |_, _, _| open_with_default_app(&path, false)),
                             )
                         }),

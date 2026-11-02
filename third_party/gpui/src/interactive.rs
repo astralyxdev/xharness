@@ -15,7 +15,14 @@ pub trait InputEvent: Sealed + 'static {
 pub trait KeyEvent: InputEvent {}
 
 /// A mouse event from the platform.
-pub trait MouseEvent: InputEvent {}
+pub trait MouseEvent: InputEvent {
+    /// (XHarness) The event as seen inside a zoomed subtree (see
+    /// `Window::with_zoom`): positions in its units.
+    #[doc(hidden)]
+    fn transformed(&self, transform: &crate::ElementTransform) -> Self
+    where
+        Self: Sized;
+}
 
 /// The key down event equivalent for the platform.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,7 +120,14 @@ impl InputEvent for MouseDownEvent {
         PlatformInput::MouseDown(self)
     }
 }
-impl MouseEvent for MouseDownEvent {}
+impl MouseEvent for MouseDownEvent {
+    fn transformed(&self, transform: &crate::ElementTransform) -> Self {
+        Self {
+            position: transform.invert(self.position),
+            ..self.clone()
+        }
+    }
+}
 
 /// A mouse up event from the platform
 #[derive(Clone, Debug, Default)]
@@ -137,7 +151,14 @@ impl InputEvent for MouseUpEvent {
         PlatformInput::MouseUp(self)
     }
 }
-impl MouseEvent for MouseUpEvent {}
+impl MouseEvent for MouseUpEvent {
+    fn transformed(&self, transform: &crate::ElementTransform) -> Self {
+        Self {
+            position: transform.invert(self.position),
+            ..self.clone()
+        }
+    }
+}
 
 /// A click event, generated when a mouse button is pressed and released.
 #[derive(Clone, Debug, Default)]
@@ -349,7 +370,14 @@ impl InputEvent for MouseMoveEvent {
         PlatformInput::MouseMove(self)
     }
 }
-impl MouseEvent for MouseMoveEvent {}
+impl MouseEvent for MouseMoveEvent {
+    fn transformed(&self, transform: &crate::ElementTransform) -> Self {
+        Self {
+            position: transform.invert(self.position),
+            ..self.clone()
+        }
+    }
+}
 
 impl MouseMoveEvent {
     /// Returns true if the left mouse button is currently held down.
@@ -380,7 +408,19 @@ impl InputEvent for ScrollWheelEvent {
         PlatformInput::ScrollWheel(self)
     }
 }
-impl MouseEvent for ScrollWheelEvent {}
+impl MouseEvent for ScrollWheelEvent {
+    fn transformed(&self, transform: &crate::ElementTransform) -> Self {
+        Self {
+            position: transform.invert(self.position),
+            // Content follows the fingers at any zoom.
+            delta: match self.delta {
+                ScrollDelta::Pixels(delta) => ScrollDelta::Pixels(delta / transform.scale),
+                lines => lines,
+            },
+            ..self.clone()
+        }
+    }
+}
 
 impl Deref for ScrollWheelEvent {
     type Target = Modifiers;
@@ -482,7 +522,14 @@ impl InputEvent for MouseExitEvent {
         PlatformInput::MouseExited(self)
     }
 }
-impl MouseEvent for MouseExitEvent {}
+impl MouseEvent for MouseExitEvent {
+    fn transformed(&self, transform: &crate::ElementTransform) -> Self {
+        Self {
+            position: transform.invert(self.position),
+            ..self.clone()
+        }
+    }
+}
 
 impl Deref for MouseExitEvent {
     type Target = Modifiers;
@@ -540,7 +587,23 @@ impl InputEvent for FileDropEvent {
         PlatformInput::FileDrop(self)
     }
 }
-impl MouseEvent for FileDropEvent {}
+impl MouseEvent for FileDropEvent {
+    fn transformed(&self, transform: &crate::ElementTransform) -> Self {
+        match self {
+            FileDropEvent::Entered { position, paths } => FileDropEvent::Entered {
+                position: transform.invert(*position),
+                paths: paths.clone(),
+            },
+            FileDropEvent::Pending { position } => FileDropEvent::Pending {
+                position: transform.invert(*position),
+            },
+            FileDropEvent::Submit { position } => FileDropEvent::Submit {
+                position: transform.invert(*position),
+            },
+            FileDropEvent::Exited => FileDropEvent::Exited,
+        }
+    }
+}
 
 /// An enum corresponding to all kinds of platform input events.
 #[derive(Clone, Debug)]

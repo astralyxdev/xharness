@@ -39,6 +39,13 @@ actions!(
 
 const KEY_CONTEXT: &str = "TextInput";
 
+/// What a text input tells whoever holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TextInputEvent {
+    /// The text changed (typing, pasting, deleting).
+    Changed,
+}
+
 /// Registers the editing shortcuts. They only apply while a text input is
 /// focused.
 pub fn bind_keys(cx: &mut App) {
@@ -86,7 +93,12 @@ pub struct TextInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    /// One line of several (a note's): Backspace at the start and pasted
+    /// newlines go to whoever holds it, which joins or splits lines.
+    line_of_many: bool,
 }
+
+impl gpui::EventEmitter<TextInputEvent> for TextInput {}
 
 impl TextInput {
     pub fn new(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
@@ -102,7 +114,31 @@ impl TextInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
+            line_of_many: false,
         }
+    }
+
+    /// A line of a multi-line text that its holder manages (see
+    /// `line_of_many`).
+    pub fn line_of_many(mut self) -> Self {
+        self.line_of_many = true;
+        self
+    }
+
+    /// Where the caret is, in bytes.
+    pub fn cursor(&self) -> usize {
+        self.cursor_offset()
+    }
+
+    /// Puts the caret at `offset` (clamped to the text), selecting nothing.
+    pub fn set_cursor(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let mut offset = offset.min(self.content.len());
+        while !self.content.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        self.selected_range = offset..offset;
+        self.selection_reversed = false;
+        cx.notify();
     }
 
     /// Render without field chrome, in the surrounding font and color.
@@ -129,6 +165,13 @@ impl TextInput {
     }
 
     /// Replaces the text, with the caret at the end.
+    /// Selects everything, as clicking into a browser's address bar does.
+    pub fn select_all_text(&mut self, cx: &mut Context<Self>) {
+        self.selected_range = 0..self.content.len();
+        self.selection_reversed = false;
+        cx.notify();
+    }
+
     pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.content = text.into();
         let end = self.content.len();
@@ -176,6 +219,11 @@ impl TextInput {
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.line_of_many && self.selected_range == (0..0) {
+            // Joins this line to the one above (the holder does it).
+            cx.propagate();
+            return;
+        }
         if self.selected_range.is_empty() {
             self.select_to(self.previous_boundary(self.cursor_offset()), cx)
         }
@@ -220,6 +268,11 @@ impl TextInput {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            if self.line_of_many && text.contains('\n') {
+                // Several lines: the holder splits them.
+                cx.propagate();
+                return;
+            }
             self.replace_text_in_range(None, &text.replace('\n', " "), window, cx);
         }
     }
@@ -396,6 +449,7 @@ impl EntityInputHandler for TextInput {
                 .into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
+        cx.emit(TextInputEvent::Changed);
         cx.notify();
     }
 

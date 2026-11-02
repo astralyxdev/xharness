@@ -41,9 +41,10 @@ use gpui::{
     radians, rems, uniform_list,
 };
 
+use crate::i18n::{t, tf, tn};
 use crate::ui::actions::{Cancel, Confirm, SelectNext, SelectPrevious};
 use crate::ui::assets::IconName;
-use crate::ui::context_menu::MenuEntry;
+use crate::ui::context_menu::{MenuAt, MenuEntry};
 use crate::services::files::{self, Entry, ListOptions, SEARCH_LIMIT, list_dir, transfer};
 use crate::services::projects::{ExplorerColumn, ExplorerSettings, SortKey};
 use crate::services::server::HostAddress;
@@ -158,7 +159,7 @@ pub enum ExplorerEvent {
     /// Show this menu at `position` (window coordinates).
     Menu {
         entries: Vec<MenuEntry>,
-        position: Point<Pixels>,
+        position: MenuAt,
     },
 }
 
@@ -269,9 +270,19 @@ fn kind(entry: &Entry) -> Cow<'static, str> {
     known.into()
 }
 
-fn icon_for(entry: &Entry, expanded: bool) -> IconName {
+/// What the Kind column shows: [`kind`] in the app's language.
+fn kind_label(entry: &Entry) -> String {
+    match kind(entry) {
+        Cow::Borrowed(known) => t(known).to_string(),
+        Cow::Owned(_) => tf("{} file", &[&extension(entry).unwrap_or_default().to_uppercase()]),
+    }
+}
+
+/// A folder keeps its icon when it's open (the triangle says it is):
+/// Lucide's open folder is drawn differently and looks like it jumps.
+fn icon_for(entry: &Entry) -> IconName {
     if entry.is_dir {
-        return if expanded { IconName::FolderOpen } else { IconName::Folder };
+        return IconName::Folder;
     }
     match kind(entry).as_ref() {
         "Image" => IconName::FileImage,
@@ -286,7 +297,7 @@ fn icon_for(entry: &Entry, expanded: bool) -> IconName {
 pub(crate) fn format_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["bytes", "KB", "MB", "GB", "TB"];
     if bytes < 1000 {
-        return format!("{bytes} bytes");
+        return tn(bytes as usize, "{} byte", "{} bytes");
     }
     let mut value = bytes as f64;
     let mut unit = 0;
@@ -295,9 +306,9 @@ pub(crate) fn format_size(bytes: u64) -> String {
         unit += 1;
     }
     if value < 10. {
-        format!("{value:.1} {}", UNITS[unit])
+        format!("{value:.1} {}", t(UNITS[unit]))
     } else {
-        format!("{value:.0} {}", UNITS[unit])
+        format!("{value:.0} {}", t(UNITS[unit]))
     }
 }
 
@@ -330,14 +341,14 @@ fn format_modified(time: SystemTime, now: SystemTime) -> String {
     let same_day = |a: &libc::tm, b: &libc::tm| (a.tm_year, a.tm_yday) == (b.tm_year, b.tm_yday);
     let clock = format!("{:02}:{:02}", local.tm_hour, local.tm_min);
     if same_day(&local, &today) {
-        format!("Today, {clock}")
+        tf("Today, {}", &[&clock])
     } else if yesterday.is_some_and(|y| same_day(&local, &y)) {
-        format!("Yesterday, {clock}")
+        tf("Yesterday, {}", &[&clock])
     } else {
         format!(
             "{} {} {}",
             local.tm_mday,
-            MONTHS[local.tm_mon.clamp(0, 11) as usize],
+            t(MONTHS[local.tm_mon.clamp(0, 11) as usize]),
             1900 + local.tm_year
         )
     }
@@ -386,6 +397,8 @@ struct Search {
 }
 
 pub struct ExplorerView {
+    /// Where its dropdown buttons are (see [`ui::Anchors`]).
+    anchors: ui::Anchors,
     root: PathBuf,
     /// The project's folder, where an explorer with no folder of its own
     /// starts.
@@ -430,8 +443,8 @@ impl ExplorerView {
         server: Option<HostAddress>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let filter = cx.new(|cx| TextInput::new("Filter  ·  *.rs  ·  src/", cx).inline());
-        let path_input = cx.new(|cx| TextInput::new("A folder: ~/dev, ../lib, /tmp", cx).inline());
+        let filter = cx.new(|cx| TextInput::new(t("Filter  ·  *.rs  ·  src/"), cx).inline());
+        let path_input = cx.new(|cx| TextInput::new(t("A folder: ~/dev, ../lib, /tmp"), cx).inline());
         let filter_subscription = cx.observe(&filter, |this, _, cx| this.filter_changed(cx));
         let refresh = cx.spawn(async move |this, cx| {
             loop {
@@ -460,6 +473,7 @@ impl ExplorerView {
             search_task: None,
             focus_handle: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
+            anchors: ui::Anchors::default(),
             _refresh: refresh,
             _filter_subscription: filter_subscription,
         };
@@ -545,7 +559,7 @@ impl ExplorerView {
             self.selected = Some(path.clone());
             cx.emit(ExplorerEvent::OpenFile(path));
         } else {
-            self.error = Some(format!("{} isn't there.", text.trim()));
+            self.error = Some(tf("{} isn't there.", &[&text.trim()]));
             cx.notify();
             return;
         }
@@ -555,7 +569,7 @@ impl ExplorerView {
     /// Files dropped from Finder: copied in (on this Mac only, for now).
     fn drop_external(&mut self, sources: Vec<PathBuf>, into: PathBuf, cx: &mut Context<Self>) {
         if self.server.is_some() {
-            self.error = Some("Files from this Mac can't be copied to a remote server yet.".to_string());
+            self.error = Some(t("Files from this Mac can't be copied to a remote server yet.").to_string());
             cx.notify();
             return;
         }
@@ -825,10 +839,9 @@ impl ExplorerView {
         let entry = row.entry.clone();
         if row.up {
             self.go_up(cx);
-        } else if entry.is_dir && self.search.is_none() {
-            self.toggle_folder(&entry.path, cx);
         } else if entry.is_dir {
-            // A folder in search results: go there.
+            // Into the folder, as in Finder; its triangle (or →) opens it
+            // in place.
             self.set_root(entry.path, cx);
         } else {
             cx.emit(ExplorerEvent::OpenFile(entry.path));
@@ -910,7 +923,7 @@ impl ExplorerView {
 
     // Menus ----------------------------------------------------------------------
 
-    fn view_menu(&self, position: Point<Pixels>, cx: &mut Context<Self>) {
+    fn view_menu(&self, position: MenuAt, cx: &mut Context<Self>) {
         let this = cx.entity().downgrade();
         let toggle = |change: fn(&mut ExplorerSettings), relist: bool| {
             let this = this.clone();
@@ -930,15 +943,15 @@ impl ExplorerView {
             }
         };
         let entries = vec![
-            MenuEntry::check("Folders first", s.folders_first, toggle(|s| s.folders_first = !s.folders_first, false)),
-            MenuEntry::check("Show hidden files", s.show_hidden, toggle(|s| s.show_hidden = !s.show_hidden, true)),
+            MenuEntry::check(t("Folders first"), s.folders_first, toggle(|s| s.folders_first = !s.folders_first, false)),
+            MenuEntry::check(t("Show hidden files"), s.show_hidden, toggle(|s| s.show_hidden = !s.show_hidden, true)),
             MenuEntry::check(
-                "Show files ignored by git",
+                t("Show files ignored by git"),
                 s.show_ignored,
                 toggle(|s| s.show_ignored = !s.show_ignored, true),
             ),
             MenuEntry::Separator,
-            MenuEntry::item(IconName::RefreshCw, "Refresh", refresh),
+            MenuEntry::item(IconName::RefreshCw, t("Refresh"), refresh),
         ];
         cx.emit(ExplorerEvent::Menu { entries, position });
     }
@@ -949,12 +962,12 @@ impl ExplorerView {
             .into_iter()
             .map(|column| {
                 let this = this.clone();
-                MenuEntry::check(column.label(), self.settings.columns.contains(&column), move |_, cx| {
+                MenuEntry::check(t(column.label()), self.settings.columns.contains(&column), move |_, cx| {
                     this.update(cx, |this, cx| this.toggle_column(column, cx)).ok();
                 })
             })
             .collect();
-        cx.emit(ExplorerEvent::Menu { entries, position });
+        cx.emit(ExplorerEvent::Menu { entries, position: position.into() });
     }
 
     fn row_menu(&self, entry: &Entry, position: Point<Pixels>, cx: &mut Context<Self>) {
@@ -980,42 +993,42 @@ impl ExplorerView {
         };
         let mut entries = if entry.is_dir {
             vec![
-                MenuEntry::item(IconName::FolderOpen, "Open here", {
+                MenuEntry::item(IconName::FolderOpen, t("Open here"), {
                     let (this, path) = (this.clone(), path.clone());
                     move |_, cx| {
                         this.update(cx, |this, cx| this.set_root(path.clone(), cx)).ok();
                     }
                 }),
-                MenuEntry::item(IconName::FolderTree, "Open in new explorer", emit(ExplorerEvent::OpenExplorer(path.clone()))),
+                MenuEntry::item(IconName::FolderTree, t("Open in new explorer"), emit(ExplorerEvent::OpenExplorer(path.clone()))),
             ]
         } else {
             vec![
-                MenuEntry::item(IconName::FileCode, "Open", emit(ExplorerEvent::OpenFile(path.clone()))),
+                MenuEntry::item(IconName::FileCode, t("Open"), emit(ExplorerEvent::OpenFile(path.clone()))),
             ]
         };
         if self.server.is_none() {
             if !entry.is_dir {
-                entries.push(MenuEntry::item(IconName::ExternalLink, "Open with default app", {
+                entries.push(MenuEntry::item(IconName::ExternalLink, t("Open with default app"), {
                     let path = path.clone();
                     move |_, _| open_with_default_app(&path, false)
                 }));
             }
-            entries.push(MenuEntry::item(IconName::FolderOpen, "Reveal in Finder", {
+            entries.push(MenuEntry::item(IconName::FolderOpen, t("Reveal in Finder"), {
                 let path = path.clone();
                 move |_, _| open_with_default_app(&path, true)
             }));
         }
         entries.extend([
             MenuEntry::Separator,
-            MenuEntry::item(IconName::Copy, "Copy path", copy(path.display().to_string())),
-            MenuEntry::item(IconName::Copy, "Copy relative path", copy(relative.display().to_string())),
+            MenuEntry::item(IconName::Copy, t("Copy path"), copy(path.display().to_string())),
+            MenuEntry::item(IconName::Copy, t("Copy relative path"), copy(relative.display().to_string())),
             MenuEntry::Separator,
-            MenuEntry::item(IconName::SquareTerminal, "Open terminal here", move |_, cx| {
+            MenuEntry::item(IconName::SquareTerminal, t("Open terminal here"), move |_, cx| {
                 let folder = folder.clone();
                 this.update(cx, |_, cx| cx.emit(ExplorerEvent::OpenTerminal(folder))).ok();
             }),
         ]);
-        cx.emit(ExplorerEvent::Menu { entries, position });
+        cx.emit(ExplorerEvent::Menu { entries, position: position.into() });
     }
 
     // Rendering ------------------------------------------------------------------
@@ -1063,9 +1076,11 @@ impl ExplorerView {
                     }),
             )
             .child(
-                ui::small_icon_button("explorer-view", IconName::SlidersHorizontal, theme).on_click(
-                    cx.listener(|this, event: &ClickEvent, _, cx| this.view_menu(event.position(), cx)),
-                ),
+                ui::small_icon_button("explorer-view", IconName::SlidersHorizontal, theme)
+                    .child(self.anchors.track("view"))
+                    .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                        this.view_menu(this.anchors.below("view", ui::Align::End, event.position()), cx)
+                    })),
             )
             .child(
                 ui::small_icon_button("explorer-columns", IconName::ColumnsThree, theme).on_click(
@@ -1183,10 +1198,10 @@ impl ExplorerView {
                 MouseButton::Right,
                 cx.listener(|this, event: &MouseDownEvent, _, cx| this.columns_menu(event.position, cx)),
             )
-            .child(div().flex_1().min_w_0().pl(rems(2.75)).child(cell("Name", SortKey::Name)))
+            .child(div().flex_1().min_w_0().pl(rems(2.75)).child(cell(t("Name"), SortKey::Name)))
             .children(self.settings.columns.iter().map(|column| {
                 column_cell(*column)
-                    .child(cell(column.label(), column.sort_key()))
+                    .child(cell(t(column.label()), column.sort_key()))
                     .into_any_element()
             }))
     }
@@ -1317,7 +1332,7 @@ impl ExplorerView {
                         div().size_4().flex_shrink_0().into_any_element()
                     })
                     .child(
-                        ui::icon(if up { IconName::ArrowUpFromLine } else { icon_for(entry, row.expanded) })
+                        ui::icon(if up { IconName::ArrowUpFromLine } else { icon_for(entry) })
                             .text_color(if up { muted } else { icon_color }),
                     )
                     .child(
@@ -1334,7 +1349,7 @@ impl ExplorerView {
             .children(self.settings.columns.iter().map(|column| {
                 let text: SharedString = match column {
                     _ if up => SharedString::default(),
-                    ExplorerColumn::Kind => kind(entry).into_owned().into(),
+                    ExplorerColumn::Kind => kind_label(entry).into(),
                     ExplorerColumn::Size if entry.is_dir => "—".into(),
                     ExplorerColumn::Size => format_size(entry.size).into(),
                     ExplorerColumn::Modified => entry
@@ -1354,13 +1369,12 @@ impl ExplorerView {
         if let Some(error) = &self.error {
             return error.clone();
         }
-        let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
         let items = self.rows.iter().filter(|row| !row.up).count();
         match &self.search {
-            Some(search) if !search.done => "Searching…".to_string(),
-            Some(search) if search.truncated => format!("First {SEARCH_LIMIT} matches"),
-            Some(_) => count(items, "match", "matches"),
-            None => count(items, "item", "items"),
+            Some(search) if !search.done => t("Searching…").to_string(),
+            Some(search) if search.truncated => tf("First {} matches", &[&SEARCH_LIMIT]),
+            Some(_) => tn(items, "{} match", "{} matches"),
+            None => tn(items, "{} item", "{} items"),
         }
     }
 }
@@ -1440,11 +1454,11 @@ impl Render for ExplorerView {
                     .text_center()
                     .text_color(theme.muted_foreground)
                     .child(if root_missing {
-                        format!("{} isn't there any more.", ui::display_path(&self.root))
+                        tf("{} isn't there any more.", &[&ui::display_path(&self.root)])
                     } else if self.search.is_some() {
-                        "Nothing matches.".to_string()
+                        t("Nothing matches.").to_string()
                     } else {
-                        "This folder is empty.".to_string()
+                        t("This folder is empty.").to_string()
                     })
                     .into_any_element()
             } else {

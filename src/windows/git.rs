@@ -26,8 +26,9 @@ use gpui::{
     Task, UniformListScrollHandle, Window, actions, canvas, div, fill, point, prelude::*, px, rems, size, uniform_list,
 };
 
+use crate::i18n::{t, tf, tn};
 use crate::ui::assets::IconName;
-use crate::ui::context_menu::MenuEntry;
+use crate::ui::context_menu::{MenuAt, MenuEntry};
 use crate::windows::explorer::open_with_default_app;
 use crate::services::git::{self, Branch, Change, ChangeKind, Commit, Diff, DiffLine, GraphRow, Status};
 use crate::services::server::HostAddress;
@@ -52,7 +53,7 @@ pub fn bind_keys(cx: &mut App) {
 }
 
 pub enum GitEvent {
-    Menu { entries: Vec<MenuEntry>, position: Point<Pixels> },
+    Menu { entries: Vec<MenuEntry>, position: MenuAt },
     OpenFile(PathBuf),
     /// Ask before doing something that can't be undone.
     Confirm {
@@ -130,8 +131,28 @@ fn look(folder: &Path, repo: Option<PathBuf>, known_history: Option<String>, sel
     }
 }
 
+/// Dragging the edge between the file list and the diff.
+struct ResizeSidebar;
+
+impl Render for ResizeSidebar {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// The file list's width (rem), and how narrow and wide it can get.
+const SIDEBAR_WIDTH: f32 = 19.;
+const SIDEBAR_MIN: f32 = 12.;
+const SIDEBAR_MAX: f32 = 48.;
+
 pub struct GitView {
+    /// Where its dropdown buttons are (see [`ui::Anchors`]).
+    anchors: ui::Anchors,
     folder: PathBuf,
+    /// The file list's width, in rem.
+    sidebar_width: f32,
+    /// Where a drag of its edge started: the pointer's x and the width then.
+    sidebar_drag: Option<(Pixels, f32)>,
     /// The server the repository is on (`None`: this machine).
     server: Option<HostAddress>,
     repo: Repo,
@@ -178,14 +199,14 @@ impl EventEmitter<GitEvent> for GitView {}
 
 impl GitView {
     pub fn new(folder: PathBuf, server: Option<HostAddress>, cx: &mut Context<Self>) -> Self {
-        let summary = cx.new(|cx| TextInput::new("Summary (required)", cx).inline());
-        let description = cx.new(|cx| TextInput::new("Description", cx).inline());
-        let branch_input = cx.new(|cx| TextInput::new("New branch name", cx).inline());
+        let summary = cx.new(|cx| TextInput::new(t("Summary (required)"), cx).inline());
+        let description = cx.new(|cx| TextInput::new(t("Description"), cx).inline());
+        let branch_input = cx.new(|cx| TextInput::new(t("New branch name"), cx).inline());
         let remote_name = cx.new(|cx| TextInput::new("origin", cx).inline());
         let remote_url = cx.new(|cx| TextInput::new("https://github.com/you/repository.git", cx).inline());
-        let token_input = cx.new(|cx| TextInput::new("ghp_… or github_pat_…", cx).inline().masked());
-        let repo_name = cx.new(|cx| TextInput::new("Repository name", cx).inline());
-        let repo_description = cx.new(|cx| TextInput::new("Optional", cx).inline());
+        let token_input = cx.new(|cx| TextInput::new(t("ghp_… or github_pat_…"), cx).inline().masked());
+        let repo_name = cx.new(|cx| TextInput::new(t("Repository name"), cx).inline());
+        let repo_description = cx.new(|cx| TextInput::new(t("Optional"), cx).inline());
         // Buttons follow what's typed.
         let inputs = [&summary, &branch_input, &remote_name, &remote_url, &token_input, &repo_name]
             .into_iter()
@@ -214,6 +235,7 @@ impl GitView {
             }
         });
         Self {
+            anchors: ui::Anchors::default(),
             folder,
             server,
             repo: Repo::Checking,
@@ -244,6 +266,8 @@ impl GitView {
             error: None,
             focus_handle: cx.focus_handle(),
             changes_scroll: UniformListScrollHandle::new(),
+            sidebar_width: SIDEBAR_WIDTH,
+            sidebar_drag: None,
             history_scroll: UniformListScrollHandle::new(),
             diff_scroll: UniformListScrollHandle::new(),
             action: None,
@@ -265,14 +289,13 @@ impl GitView {
     pub fn summary(&self) -> Option<String> {
         match &self.repo {
             Repo::Ready(_) => {
-                let branch = self.status.branch.clone().unwrap_or_else(|| "detached HEAD".to_string());
+                let branch = self.status.branch.clone().unwrap_or_else(|| t("detached HEAD").to_string());
                 Some(match self.status.changes.len() {
                     0 => branch,
-                    1 => format!("{branch} · 1 change"),
-                    n => format!("{branch} · {n} changes"),
+                    n => format!("{branch} · {}", tn(n, "{} change", "{} changes")),
                 })
             }
-            Repo::None => Some("not a repository".to_string()),
+            Repo::None => Some(t("not a repository").to_string()),
             Repo::Checking => None,
         }
     }
@@ -505,23 +528,23 @@ impl GitView {
         self.summary.update(cx, |input, cx| input.set_text("", cx));
         self.description.update(cx, |input, cx| input.set_text("", cx));
         self.excluded.clear();
-        self.act("Committing…", move |root| git::commit(root, &summary, &description, paths.as_deref()), cx);
+        self.act(t("Committing…"), move |root| git::commit(root, &summary, &description, paths.as_deref()), cx);
     }
 
     fn sync(&mut self, cx: &mut Context<Self>) {
         let status = self.status.clone();
         if status.upstream.is_none() {
-            self.act("Publishing…", move |root| git::push(root, &status), cx);
+            self.act(t("Publishing…"), move |root| git::push(root, &status), cx);
         } else if status.behind > 0 {
-            self.act("Pulling…", git::pull, cx);
+            self.act(t("Pulling…"), git::pull, cx);
         } else if status.ahead > 0 {
-            self.act("Pushing…", move |root| git::push(root, &status), cx);
+            self.act(t("Pushing…"), move |root| git::push(root, &status), cx);
         } else {
-            self.act("Fetching…", git::fetch, cx);
+            self.act(t("Fetching…"), git::fetch, cx);
         }
     }
 
-    fn branch_menu(&self, position: Point<Pixels>, cx: &mut Context<Self>) {
+    fn branch_menu(&self, position: MenuAt, cx: &mut Context<Self>) {
         let this = cx.entity().downgrade();
         let mut entries: Vec<MenuEntry> = Vec::new();
         let (local, remote): (Vec<&Branch>, Vec<&Branch>) = self.branches.iter().partition(|b| !b.remote);
@@ -530,14 +553,14 @@ impl GitView {
             let target = branch.clone();
             entries.push(MenuEntry::check(branch.name.clone(), branch.current, move |_, cx| {
                 let target = target.clone();
-                this.update(cx, |this, cx| this.act("Switching…", move |root| git::switch(root, &target), cx))
+                this.update(cx, |this, cx| this.act(t("Switching…"), move |root| git::switch(root, &target), cx))
                     .ok();
             }));
         }
         if !entries.is_empty() {
             entries.push(MenuEntry::Separator);
         }
-        entries.push(MenuEntry::item(IconName::Plus, "New branch…", move |window, cx| {
+        entries.push(MenuEntry::item(IconName::Plus, t("New branch…"), move |window, cx| {
             this.update(cx, |this, cx| {
                 this.creating_branch = true;
                 this.branch_input.update(cx, |input, cx| input.set_text("", cx));
@@ -556,7 +579,7 @@ impl GitView {
         }
         self.creating_branch = false;
         window.focus(&self.focus_handle);
-        self.act("Creating branch…", move |root| git::create_branch(root, &name), cx);
+        self.act(t("Creating branch…"), move |root| git::create_branch(root, &name), cx);
     }
 
     fn change_menu(&self, change: &Change, position: Point<Pixels>, cx: &mut Context<Self>) {
@@ -568,46 +591,46 @@ impl GitView {
         let mut entries = Vec::new();
         if change.kind != ChangeKind::Deleted {
             let (this, path) = (this.clone(), path.clone());
-            entries.push(MenuEntry::item(IconName::FileCode, "Open", move |_, cx| {
+            entries.push(MenuEntry::item(IconName::FileCode, t("Open"), move |_, cx| {
                 let path = path.clone();
                 this.update(cx, |_, cx| cx.emit(GitEvent::OpenFile(path))).ok();
             }));
             let path = root.join(&change.path);
-            entries.push(MenuEntry::item(IconName::FolderOpen, "Reveal in Finder", move |_, _| {
+            entries.push(MenuEntry::item(IconName::FolderOpen, t("Reveal in Finder"), move |_, _| {
                 open_with_default_app(&path, true)
             }));
         }
         let relative = change.path.clone();
-        entries.push(MenuEntry::item(IconName::Copy, "Copy path", move |_, cx| {
+        entries.push(MenuEntry::item(IconName::Copy, t("Copy path"), move |_, cx| {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(relative.clone()));
         }));
         entries.push(MenuEntry::Separator);
         let target = change.clone();
-        entries.push(MenuEntry::destructive(IconName::Trash, "Discard changes…", move |_, cx| {
+        entries.push(MenuEntry::destructive(IconName::Trash, t("Discard changes…"), move |_, cx| {
             let (weak, change) = (this.clone(), target.clone());
             let action: Rc<dyn Fn(&mut App)> = Rc::new(move |cx: &mut App| {
                 let target = change.clone();
-                weak.update(cx, |this, cx| this.act("Discarding…", move |root| git::discard(root, &target), cx))
+                weak.update(cx, |this, cx| this.act(t("Discarding…"), move |root| git::discard(root, &target), cx))
                     .ok();
             });
             let name = Path::new(&target.path).file_name().map_or(target.path.clone(), |n| n.to_string_lossy().into_owned());
             this.update(cx, |_, cx| {
                 cx.emit(GitEvent::Confirm {
-                    title: format!("Discard changes to “{name}”?"),
-                    description: "The file goes back to how it was in the last commit. This can't be undone.".to_string(),
-                    confirm: "Discard changes".to_string(),
+                    title: tf("Discard changes to “{}”?", &[&name]),
+                    description: t("The file goes back to how it was in the last commit. This can't be undone.").to_string(),
+                    confirm: t("Discard changes").to_string(),
                     action,
                 })
             })
             .ok();
         }));
-        cx.emit(GitEvent::Menu { entries, position });
+        cx.emit(GitEvent::Menu { entries, position: position.into() });
     }
 
     // Rendering ------------------------------------------------------------------------
 
     fn render_toolbar(&self, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
-        let branch = self.status.branch.clone().unwrap_or_else(|| "Detached HEAD".to_string());
+        let branch = self.status.branch.clone().unwrap_or_else(|| t("Detached HEAD").to_string());
         let bar = div()
             .flex()
             .flex_shrink_0()
@@ -631,7 +654,7 @@ impl GitView {
                         .child(div().flex_1().min_w_0().child(self.branch_input.clone())),
                 )
                 .child(
-                    ui::compact_button("git-create-branch", None, "Create branch", true, theme)
+                    ui::compact_button("git-create-branch", None, t("Create branch"), true, theme)
                         .when(!can_create, |b| b.opacity(0.5))
                         .on_click(cx.listener(|this, _, window, cx| this.create_branch(window, cx))),
                 )
@@ -641,11 +664,11 @@ impl GitView {
         let has_remote = !self.remotes.is_empty();
         let (icon, label) = match self.busy {
             Some(busy) => (IconName::RefreshCw, busy.to_string()),
-            None if !has_remote => (IconName::Plus, "Add remote".to_string()),
-            None if status.upstream.is_none() => (IconName::ArrowUp, "Publish branch".to_string()),
-            None if status.behind > 0 => (IconName::ArrowDown, format!("Pull {}", status.behind)),
-            None if status.ahead > 0 => (IconName::ArrowUp, format!("Push {}", status.ahead)),
-            None => (IconName::RefreshCw, "Fetch".to_string()),
+            None if !has_remote => (IconName::Plus, t("Add remote").to_string()),
+            None if status.upstream.is_none() => (IconName::ArrowUp, t("Publish branch").to_string()),
+            None if status.behind > 0 => (IconName::ArrowDown, tf("Pull {}", &[&status.behind])),
+            None if status.ahead > 0 => (IconName::ArrowUp, tf("Push {}", &[&status.ahead])),
+            None => (IconName::RefreshCw, t("Fetch").to_string()),
         };
         let can_sync = self.busy.is_none() && has_remote && status.head.is_some();
         let remote_label = match self.remotes.as_slice() {
@@ -677,7 +700,7 @@ impl GitView {
                                 .text_size(rems(0.625))
                                 .line_height(rems(0.75))
                                 .text_color(theme.muted_foreground)
-                                .child("Current branch"),
+                                .child(t("Current branch")),
                         )
                         .child(
                             div()
@@ -690,7 +713,10 @@ impl GitView {
                 )
                 .child(div().flex_1())
                 .child(ui::chevron(false, theme).size_3())
-                .on_click(cx.listener(|this, event: &ClickEvent, _, cx| this.branch_menu(event.position(), cx))),
+                .child(self.anchors.track("branch"))
+                .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                    this.branch_menu(this.anchors.below("branch", ui::Align::Start, event.position()), cx)
+                })),
         )
         .children(remote_label.map(|label| {
             ui::compact_button("git-remotes", Some(IconName::Cloud), &label, false, theme)
@@ -737,8 +763,8 @@ impl GitView {
                 .on_click(cx.listener(move |this, _, _, cx| this.set_tab(tab, cx)))
         };
         let changes = match self.status.changes.len() {
-            0 => "Changes".to_string(),
-            n => format!("Changes {n}"),
+            0 => t("Changes").to_string(),
+            n => tf("Changes {}", &[&n]),
         };
         div()
             .flex()
@@ -746,7 +772,7 @@ impl GitView {
             .border_b_1()
             .border_color(theme.border)
             .child(tab("git-tab-changes", changes, Tab::Changes))
-            .child(tab("git-tab-history", "History".to_string(), Tab::History))
+            .child(tab("git-tab-history", t("History").to_string(), Tab::History))
     }
 
     fn render_changes(&self, theme: &Theme, cx: &Context<Self>) -> AnyElement {
@@ -762,7 +788,7 @@ impl GitView {
                 .text_center()
                 .text_size(rems(0.75))
                 .text_color(theme.muted_foreground)
-                .child("No changes. Edits to files in this repository show up here.")
+                .child(t("No changes. Edits to files in this repository show up here."))
                 .into_any_element();
         }
         let all = included == changes;
@@ -786,7 +812,7 @@ impl GitView {
                     .text_color(theme.muted_foreground)
                     .cursor_pointer()
                     .child(checkbox(all, included > 0 && !all, theme))
-                    .child(format!("{changes} changed {}", if changes == 1 { "file" } else { "files" }))
+                    .child(tn(changes, "{} changed file", "{} changed files"))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if all {
                             this.excluded = this.status.changes.iter().map(|c| c.path.clone()).collect();
@@ -848,16 +874,23 @@ impl GitView {
                     })),
             )
             .child(
+                // The name first, whole; the folder after it gives way
+                // (all of the path is in the tooltip).
                 div()
                     .flex()
                     .flex_1()
                     .min_w_0()
+                    .gap_1p5()
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .child(div().flex_shrink_0().text_color(theme.muted_foreground).child(dir))
-                    .child(div().min_w_0().truncate().child(name)),
+                    .child(div().flex_shrink_0().max_w_full().truncate().child(name))
+                    .child(div().min_w_0().truncate().text_color(theme.muted_foreground).child(dir.trim_end_matches('/').to_string())),
             )
             .child(status_badge(change.kind, theme))
+            .tooltip({
+                let path = path.clone();
+                move |_, cx| cx.new(|_| ui::Tooltip::new(path.clone(), "")).into()
+            })
             .on_click(cx.listener({
                 let path = path.clone();
                 move |this, _, window, cx| {
@@ -882,9 +915,8 @@ impl GitView {
         let ready = !self.summary.read(cx).text().trim().is_empty() && included > 0 && self.busy.is_none();
         let branch = self.status.branch.clone().unwrap_or_else(|| "HEAD".to_string());
         let label = match included {
-            0 => "Nothing to commit".to_string(),
-            1 => format!("Commit 1 file to {branch}"),
-            n => format!("Commit {n} files to {branch}"),
+            0 => t("Nothing to commit").to_string(),
+            n => tf("Commit {} to {}", &[&tn(n, "{} file", "{} files"), &branch]),
         };
         div()
             .flex()
@@ -913,7 +945,7 @@ impl GitView {
                 .justify_center()
                 .text_size(rems(0.75))
                 .text_color(theme.muted_foreground)
-                .child("No commits yet.")
+                .child(t("No commits yet."))
                 .into_any_element();
         }
         uniform_list(
@@ -937,7 +969,7 @@ impl GitView {
         let selected = self.selected_commit == Some(ix);
         let palette = lane_palette(theme);
         let background = if selected { theme.tints.blue.soft } else { theme.background };
-        let ago = format!("{} ago", crate::services::lino::format_span((now - commit.time).max(0) as u64).split(' ').next().unwrap_or(""));
+        let ago = crate::windows::lino::format_ago((now - commit.time).max(0) as u64);
         let hover = theme.accent;
         div()
             .id(ElementId::named_usize("git-commit-row", ix))
@@ -1047,7 +1079,7 @@ impl GitView {
                             .text_color(theme.muted_foreground)
                             .child(commit.author.clone())
                             .child(div().font_family(FONT_MONO).child(commit.short().to_string()))
-                            .child(format!("{files} changed {}", if files == 1 { "file" } else { "files" })),
+                            .child(tn(files, "{} changed file", "{} changed files")),
                     ),
             )
             .child(
@@ -1102,7 +1134,7 @@ impl GitView {
             Err(error) => return message(error.clone()),
         };
         if diff.lines.is_empty() {
-            return message("No changes to show (only the file's mode, or nothing at all, changed).".to_string());
+            return message(t("No changes to show (only the file's mode, or nothing at all, changed).").to_string());
         }
         let lines = diff.lines.len();
         div()
@@ -1124,7 +1156,7 @@ impl GitView {
                     .child(div().flex_1().min_w_0().truncate().child(path.clone()))
                     .child(div().text_color(theme.tints.green.soft_foreground).child(format!("+{}", diff.added)))
                     .child(div().text_color(theme.tints.destructive.soft_foreground).child(format!("−{}", diff.removed)))
-                    .when(diff.truncated, |el| el.child(div().text_color(theme.muted_foreground).child("(cut short)"))),
+                    .when(diff.truncated, |el| el.child(div().text_color(theme.muted_foreground).child(t("(cut short)")))),
             )
             .child(
                 uniform_list(
@@ -1195,7 +1227,7 @@ impl Render for GitView {
                     .items_center()
                     .justify_center()
                     .text_color(theme.muted_foreground)
-                    .child("Looking for a repository…"),
+                    .child(t("Looking for a repository…")),
             ),
             Repo::None => root.child(
                 div()
@@ -1207,15 +1239,15 @@ impl Render for GitView {
                     .gap_3()
                     .px_8()
                     .text_center()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("This folder isn't a git repository"))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(t("This folder isn't a git repository")))
                     .child(
                         div()
                             .max_w(rems(26.))
                             .text_color(theme.muted_foreground)
-                            .child(format!("Create one in {} to track changes and commit them.", ui::display_path(&self.folder))),
+                            .child(tf("Create one in {} to track changes and commit them.", &[&ui::display_path(&self.folder)])),
                     )
                     .child(
-                        ui::compact_button("git-init", Some(IconName::Plus), "Create repository", true, theme).on_click(
+                        ui::compact_button("git-init", Some(IconName::Plus), t("Create repository"), true, theme).on_click(
                             cx.listener(|this, _, _, cx| {
                                 let folder = this.folder.clone();
                                 let server = this.server.clone();
@@ -1265,12 +1297,20 @@ impl Render for GitView {
                         .flex()
                         .flex_1()
                         .min_h_0()
+                        .on_drag_move(cx.listener(|this, event: &gpui::DragMoveEvent<ResizeSidebar>, window, cx| {
+                            if let Some((start_x, start_width)) = this.sidebar_drag {
+                                let moved = (event.event.position.x - start_x) / window.rem_size();
+                                this.sidebar_width = (start_width + moved).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+                                cx.notify();
+                            }
+                        }))
                         .child(
                             div()
+                                .relative()
                                 .flex()
                                 .flex_col()
                                 .flex_shrink_0()
-                                .w(rems(19.))
+                                .w(rems(self.sidebar_width))
                                 .border_r_1()
                                 .border_color(theme.border)
                                 .child(self.render_tabs(theme, cx))
@@ -1279,7 +1319,36 @@ impl Render for GitView {
                                         .child(self.render_changes(theme, cx))
                                         .child(self.render_commit_box(theme, cx)),
                                     Tab::History => pane.child(self.render_history(theme, cx)),
-                                }),
+                                })
+                                .child(
+                                    // Its right edge: drag to make the list
+                                    // wider or narrower; double-click resets.
+                                    div()
+                                        .id("git-sidebar-edge")
+                                        .absolute()
+                                        .top_0()
+                                        .bottom_0()
+                                        .right(rems(-0.25))
+                                        .w(rems(0.5))
+                                        .cursor(gpui::CursorStyle::ResizeLeftRight)
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                                cx.stop_propagation();
+                                                this.sidebar_drag = Some((event.position.x, this.sidebar_width));
+                                            }),
+                                        )
+                                        .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
+                                            if event.click_count() == 2 {
+                                                this.sidebar_width = SIDEBAR_WIDTH;
+                                                cx.notify();
+                                            }
+                                        }))
+                                        .on_drag(ResizeSidebar, |_, _, window, cx| {
+                                            cx.set_active_drag_cursor_style(gpui::CursorStyle::ResizeLeftRight, window);
+                                            cx.new(|_| ResizeSidebar)
+                                        }),
+                                ),
                         )
                         .child(self.render_detail(theme, cx)),
                 )),

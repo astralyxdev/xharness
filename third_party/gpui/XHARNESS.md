@@ -15,3 +15,15 @@ Nothing else differs; macOS and Linux builds are unchanged. Remove the
 
 - `src/taffy.rs` line 312: explicit `f32` literals (silences a warning that
   shows now that gpui builds as a path dependency).
+- `src/platform/mac/platform.rs` (`set_cursor_style`): leaves the cursor
+  alone while the mouse is over a native view that isn't GPUI's (a Browser
+  window's web page sets its own: the I-beam over text, the hand over
+  links). `src/platform/mac/window.rs` exposes GPUI's view class for that
+  check (`view_class`).
+- Zoomed subtrees (`Window::with_zoom`, `ElementTransform` in
+  `src/window.rs`, with `src/scene.rs`, `src/view.rs` and
+  `src/interactive.rs`): a canvas window lays out at 100% and is drawn
+  zoomed; hit testing and events stay in its own units.
+- `src/elements/svg.rs` (`paint`): a transformed SVG (a rotated disclosure
+  arrow) turns around its drawn center inside a zoomed subtree, not its
+  laid-out one, which put it off its place at any zoom but 100%.

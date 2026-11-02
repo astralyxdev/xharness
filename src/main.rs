@@ -21,6 +21,8 @@ mod app;
 #[cfg(feature = "gui")]
 mod canvas;
 #[cfg(feature = "gui")]
+mod i18n;
+#[cfg(feature = "gui")]
 mod platform;
 mod services;
 #[cfg(feature = "gui")]
@@ -76,11 +78,20 @@ pub fn run() {
         return;
     }
 
-    Application::new().with_assets(Assets).run(|cx: &mut App| {
+    // One app: a second start shows the first one's window instead.
+    #[cfg(unix)]
+    let shows = match app::instance::claim() {
+        app::instance::Instance::First(shows) => shows,
+        app::instance::Instance::AlreadyRunning => return,
+    };
+
+    Application::new().with_assets(Assets).run(move |cx: &mut App| {
         #[cfg(target_os = "macos")]
         macos::set_app_icon(assets::LOGO);
 
         windows::Mods::init(cx);
+        app::settings::Settings::init(cx);
+        app::palette::bind_keys(cx);
         ui::text_input::bind_keys(cx);
         ui::context_menu::bind_keys(cx);
         ui::alert_dialog::bind_keys(cx);
@@ -89,6 +100,8 @@ pub fn run() {
         windows::editor::bind_keys(cx);
         windows::git::bind_keys(cx);
         windows::terminal::bind_keys(cx);
+        windows::browser::bind_keys(cx);
+        windows::sftp::bind_keys(cx);
         canvas::bind_keys(cx);
         cx.bind_keys([
             KeyBinding::new("enter", Confirm, Some(RENAME_CONTEXT)),
@@ -136,6 +149,25 @@ pub fn run() {
         )
         .expect("failed to open window");
         cx.activate(true);
+
+        // Started again (from the menu bar icon, say): come to the front.
+        #[cfg(unix)]
+        cx.spawn(async move |cx| {
+            use futures::StreamExt;
+            let mut shows = shows;
+            while shows.next().await.is_some() {
+                let shown = cx.update(|cx| {
+                    cx.activate(true);
+                    for window in cx.windows() {
+                        window.update(cx, |_, window, _| window.activate_window()).ok();
+                    }
+                });
+                if shown.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
     });
 }
 }

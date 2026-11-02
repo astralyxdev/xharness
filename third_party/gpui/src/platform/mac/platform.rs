@@ -458,6 +458,32 @@ impl MacPlatform {
     }
 }
 
+/// xharness: whether the view under the mouse, in one of the app's windows,
+/// is another view than GPUI's own (see `set_cursor_style`).
+unsafe fn native_view_under_mouse() -> bool {
+    unsafe {
+        let location: cocoa::foundation::NSPoint = msg_send![class!(NSEvent), mouseLocation];
+        let number: NSInteger =
+            msg_send![class!(NSWindow), windowNumberAtPoint: location belowWindowWithWindowNumber: 0 as NSInteger];
+        let app: id = msg_send![class!(NSApplication), sharedApplication];
+        let window: id = msg_send![app, windowWithWindowNumber: number];
+        if window == nil {
+            return false;
+        }
+        let content: id = msg_send![window, contentView];
+        if content == nil {
+            return false;
+        }
+        let point: cocoa::foundation::NSPoint = msg_send![window, convertPointFromScreen: location];
+        let hit: id = msg_send![content, hitTest: point];
+        if hit == nil || hit == content {
+            return false;
+        }
+        let gpui_view: BOOL = msg_send![hit, isKindOfClass: super::window::view_class()];
+        gpui_view == NO
+    }
+}
+
 impl Platform for MacPlatform {
     fn background_executor(&self) -> BackgroundExecutor {
         self.0.lock().background_executor.clone()
@@ -965,6 +991,11 @@ impl Platform for MacPlatform {
     /// in macOS's [NSCursor](https://developer.apple.com/documentation/appkit/nscursor).
     fn set_cursor_style(&self, style: CursorStyle) {
         unsafe {
+            // xharness: a native view the app put over GPUI's (a web page)
+            // sets its own cursor; GPUI's would replace it every frame.
+            if native_view_under_mouse() {
+                return;
+            }
             if style == CursorStyle::None {
                 let _: () = msg_send![class!(NSCursor), setHiddenUntilMouseMoves:YES];
                 return;

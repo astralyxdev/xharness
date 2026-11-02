@@ -16,7 +16,71 @@ use gpui::{
 };
 
 use crate::ui::assets::IconName;
+use crate::ui::context_menu::MenuAt;
 use crate::ui::theme::{Theme, radius};
+
+/// Where the buttons that open menus are, so a menu opens against its
+/// button, like a dropdown, instead of wherever the pointer clicked. A
+/// button carries [`Anchors::track`] (it records where the button was
+/// drawn); its click asks [`Anchors::below`] or [`Anchors::above`] where
+/// the menu goes. Positions are the view's own: inside a canvas window
+/// they're the window's, as its events' are, and the canvas maps them.
+#[derive(Clone, Default)]
+pub struct Anchors(std::rc::Rc<std::cell::RefCell<std::collections::HashMap<SharedString, gpui::Bounds<gpui::Pixels>>>>);
+
+/// Which edge of the button the menu lines up with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Align {
+    Start,
+    End,
+}
+
+/// Room between a button and its menu.
+const MENU_GAP: f32 = 4.;
+
+impl Anchors {
+    /// An element for inside the button `key`: it fills the button and
+    /// records where it's drawn. Draws nothing and takes no clicks.
+    pub fn track(&self, key: impl Into<SharedString>) -> impl IntoElement {
+        let (anchors, key) = (self.0.clone(), key.into());
+        gpui::canvas(
+            move |bounds, _, _| {
+                anchors.borrow_mut().insert(key.clone(), bounds);
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+    }
+
+    /// A menu just under the button, lined up with its `align` edge;
+    /// `fallback` (the pointer) if the button hasn't been drawn.
+    pub fn below(&self, key: &str, align: Align, fallback: gpui::Point<gpui::Pixels>) -> MenuAt {
+        let Some(bounds) = self.0.borrow().get(key).copied() else {
+            return fallback.into();
+        };
+        let y = bounds.bottom() + px(MENU_GAP);
+        match align {
+            Align::Start => MenuAt { point: gpui::point(bounds.left(), y), corner: gpui::Corner::TopLeft },
+            Align::End => MenuAt { point: gpui::point(bounds.right(), y), corner: gpui::Corner::TopRight },
+        }
+    }
+
+    /// A menu just over the button (for buttons at the bottom of the
+    /// screen), lined up with its `align` edge.
+    pub fn above(&self, key: &str, align: Align, fallback: gpui::Point<gpui::Pixels>) -> MenuAt {
+        let Some(bounds) = self.0.borrow().get(key).copied() else {
+            return fallback.into();
+        };
+        let y = bounds.top() - px(MENU_GAP);
+        match align {
+            Align::Start => MenuAt { point: gpui::point(bounds.left(), y), corner: gpui::Corner::BottomLeft },
+            Align::End => MenuAt { point: gpui::point(bounds.right(), y), corner: gpui::Corner::BottomRight },
+        }
+    }
+}
 
 /// A 16px (`size-4`) icon. GPUI icons don't inherit text color, so callers
 /// set it with `text_color` / `group_hover`.
@@ -453,5 +517,191 @@ pub fn display_path(path: &std::path::Path) -> String {
         Some(relative) if relative.as_os_str().is_empty() => "~".to_string(),
         Some(relative) => format!("~/{}", relative.display()),
         None => path.display().to_string(),
+    }
+}
+
+/// A round avatar with initials on `color` (the profile in the header and
+/// Settings).
+pub fn avatar(initials: impl Into<SharedString>, color: Hsla, size: f32) -> Div {
+    div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .size(px(size))
+        .rounded_full()
+        .bg(color)
+        .text_color(gpui::white())
+        .text_size(px((size * 0.42).round()))
+        .line_height(px(size))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(initials.into())
+}
+
+/// One choice of a [`segmented`] control.
+pub struct Segment {
+    pub label: SharedString,
+    pub icon: Option<IconName>,
+    pub selected: bool,
+    pub on_click: Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>,
+}
+
+impl Segment {
+    pub fn new(
+        label: impl Into<SharedString>,
+        selected: bool,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            icon: None,
+            selected,
+            on_click: Box::new(on_click),
+        }
+    }
+
+    pub fn icon(mut self, icon: IconName) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+}
+
+/// A row of choices where one is picked (a segmented control): p-1 bg-muted
+/// rounded-xl, the picked one a raised card.
+pub fn segmented(id: impl Into<SharedString>, segments: Vec<Segment>, theme: &Theme) -> Div {
+    let id: SharedString = id.into();
+    let (muted_fg, fg, card, border, hover) = (theme.muted_foreground, theme.foreground, theme.card, theme.border, theme.secondary_hover);
+    div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .gap(px(2.))
+        .p(px(3.))
+        .rounded(radius::LG)
+        .bg(theme.muted)
+        .border_1()
+        .border_color(theme.border)
+        .children(segments.into_iter().enumerate().map(move |(ix, segment)| {
+            let selected = segment.selected;
+            div()
+                .id(ElementId::NamedInteger(id.clone(), ix as u64))
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .h(px(28.))
+                .px(px(12.))
+                .rounded(radius::SM)
+                .text_size(px(12.))
+                .line_height(px(16.))
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .map(|el| {
+                    if selected {
+                        el.bg(card).text_color(fg).border_1().border_color(border).shadow(vec![gpui::BoxShadow {
+                            color: gpui::black().opacity(0.06),
+                            offset: gpui::point(px(0.), px(1.)),
+                            blur_radius: px(2.),
+                            spread_radius: px(0.),
+                        }])
+                    } else {
+                        el.text_color(muted_fg).hover(move |style| style.bg(hover).text_color(fg))
+                    }
+                })
+                .children(segment.icon.map(|name| icon(name).size_3p5().text_color(if selected { fg } else { muted_fg })))
+                .child(segment.label)
+                .on_click(segment.on_click)
+        }))
+}
+
+/// An on/off switch: w-9 h-5 rounded-full, the knob slides right when on.
+pub fn switch(id: impl Into<ElementId>, on: bool, theme: &Theme) -> Stateful<Div> {
+    let (track, knob) = if on { (theme.primary, theme.primary_foreground) } else { (theme.input, gpui::white()) };
+    div()
+        .id(id)
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .w(px(36.))
+        .h(px(20.))
+        .p(px(2.))
+        .rounded_full()
+        .bg(track)
+        .cursor_pointer()
+        .when(on, |el| el.justify_end())
+        .child(div().size(px(16.)).rounded_full().bg(knob).shadow(vec![gpui::BoxShadow {
+            color: gpui::black().opacity(0.2),
+            offset: gpui::point(px(0.), px(1.)),
+            blur_radius: px(2.),
+            spread_radius: px(0.),
+        }]))
+}
+
+/// A key cap, for shortcuts: `⌘K`.
+pub fn kbd(keys: impl Into<SharedString>, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .h(px(20.))
+        .px(px(6.))
+        .rounded(radius::XS)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.muted)
+        .text_size(px(11.))
+        .line_height(px(14.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(theme.muted_foreground)
+        .child(keys.into())
+}
+
+/// The platform's name for the shortcut key, as key caps show it.
+pub fn shortcut(keys: &str) -> String {
+    if cfg!(target_os = "macos") {
+        keys.replace("Cmd+", "⌘").replace("Shift+", "⇧").replace("Alt+", "⌥").replace("Ctrl+", "⌃")
+    } else {
+        keys.replace("Cmd+", "Ctrl+")
+    }
+}
+
+/// A tooltip: a label and, optionally, its shortcut.
+pub struct Tooltip {
+    label: SharedString,
+    keys: SharedString,
+}
+
+impl Tooltip {
+    pub fn new(label: impl Into<SharedString>, keys: impl Into<SharedString>) -> Self {
+        Self {
+            label: label.into(),
+            keys: keys.into(),
+        }
+    }
+}
+
+impl Render for Tooltip {
+    fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        let theme = Theme::global(cx);
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .py(px(4.))
+            .px(px(8.))
+            .rounded(radius::SM)
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.popover)
+            .text_color(theme.popover_foreground)
+            .text_size(px(12.))
+            .line_height(px(16.))
+            .shadow(vec![gpui::BoxShadow {
+                color: gpui::black().opacity(0.12),
+                offset: gpui::point(px(0.), px(2.)),
+                blur_radius: px(8.),
+                spread_radius: px(0.),
+            }])
+            .child(self.label.clone())
+            .when(!self.keys.is_empty(), |el| el.child(kbd(shortcut(&self.keys), theme)))
     }
 }

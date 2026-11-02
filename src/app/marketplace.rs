@@ -4,6 +4,7 @@
 
 use gpui::{App, Context, FontWeight, Task, Window, div, prelude::*, px, relative};
 
+use crate::i18n::{t, tf};
 use crate::windows::{MODS, Mod, Mods};
 
 use crate::ui::assets::IconName;
@@ -94,14 +95,14 @@ impl MarketplaceView {
         let installed = Mods::installed(item.kind, cx);
         let kind = item.kind;
         let button = if installed {
-            Button::new(("mod-uninstall", ix), "Uninstall")
+            Button::new(("mod-uninstall", ix), t("Uninstall"))
                 .variant(Variant::Soft)
                 .on_click(cx.listener(move |_, _, _, cx| {
                     Mods::set(kind, false, cx);
                     cx.notify();
                 }))
         } else {
-            Button::new(("mod-install", ix), "Install")
+            Button::new(("mod-install", ix), t("Install"))
                 .icon(IconName::Download)
                 .on_click(cx.listener(move |_, _, _, cx| {
                     Mods::set(kind, true, cx);
@@ -109,41 +110,41 @@ impl MarketplaceView {
                 }))
         };
         let (status, tint) = if installed {
-            ("Installed · built in", Some(theme.tints.green))
+            (t("Installed · built in"), Some(theme.tints.green))
         } else {
-            ("Not installed", None)
+            (t("Not installed"), None)
         };
         card(theme)
-            .child(card_title(item.icon(), item.name, "Window · built in".to_string(), theme.tints.blue, theme))
-            .child(card_text(item.description, theme))
+            .child(card_title(item.icon(), t(item.name), t("Window · built in").to_string(), theme.tints.blue, theme))
+            .child(card_text(t(item.description), theme))
             .child(card_footer(status.to_string(), tint, Some(button), theme))
     }
 
     fn render_card(&self, ix: usize, spec: &Spec, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
         let state = &self.states[ix];
         let how = match spec.source {
-            Source::GithubGz { .. } | Source::GithubBinary { .. } => "GitHub release",
+            Source::GithubGz { .. } | Source::GithubBinary { .. } => t("GitHub release"),
             Source::Npm { .. } => "npm",
             Source::Go { .. } => "go install",
-            Source::System => "Xcode tools",
+            Source::System => t("Xcode tools"),
         };
         let (status, tint): (String, Option<_>) = match state {
-            State::Checking => ("Checking…".to_string(), None),
-            State::Ready(Installed::Here) => ("Installed".to_string(), Some(theme.tints.green)),
-            State::Ready(Installed::System(path)) => (format!("On your system · {}", ui::display_path(path)), Some(theme.tints.blue)),
-            State::Ready(Installed::No) => ("Not installed".to_string(), None),
-            State::Installing => ("Installing…".to_string(), Some(theme.tints.amber)),
-            State::Removing => ("Removing…".to_string(), Some(theme.tints.amber)),
-            State::Failed(_) => ("Didn't install".to_string(), Some(theme.tints.destructive)),
+            State::Checking => (t("Checking…").to_string(), None),
+            State::Ready(Installed::Here) => (t("Installed").to_string(), Some(theme.tints.green)),
+            State::Ready(Installed::System(path)) => (tf("On your system · {}", &[&ui::display_path(path)]), Some(theme.tints.blue)),
+            State::Ready(Installed::No) => (t("Not installed").to_string(), None),
+            State::Installing => (t("Installing…").to_string(), Some(theme.tints.amber)),
+            State::Removing => (t("Removing…").to_string(), Some(theme.tints.amber)),
+            State::Failed(_) => (t("Didn't install").to_string(), Some(theme.tints.destructive)),
         };
         let button = match state {
             State::Ready(Installed::Here) => Some(
-                Button::new(("uninstall", ix), "Uninstall")
+                Button::new(("uninstall", ix), t("Uninstall"))
                     .variant(Variant::Soft)
                     .on_click(cx.listener(move |this, _, _, cx| this.run(ix, false, cx))),
             ),
             State::Ready(Installed::No) | State::Failed(_) if !matches!(spec.source, Source::System) => Some(
-                Button::new(("install", ix), "Install")
+                Button::new(("install", ix), t("Install"))
                     .icon(IconName::Download)
                     .on_click(cx.listener(move |this, _, _, cx| this.run(ix, true, cx))),
             ),
@@ -151,7 +152,7 @@ impl MarketplaceView {
         };
         card(theme)
             .child(card_title(IconName::FileCode, spec.name, format!("{} · {how}", spec.languages), theme.tints.violet, theme))
-            .child(card_text(spec.description, theme))
+            .child(card_text(t(spec.description), theme))
             .children(match state {
                 State::Failed(error) => Some(
                     div()
@@ -253,7 +254,7 @@ impl Render for MarketplaceView {
                             .flex()
                             .flex_col()
                             .gap_2()
-                            .child(div().text_size(px(28.)).font_weight(FontWeight::SEMIBOLD).child("Marketplace"))
+                            .child(div().text_size(px(28.)).font_weight(FontWeight::SEMIBOLD).child(t("Marketplace")))
                             .child(
                                 div()
                                     .max_w(px(620.))
@@ -261,13 +262,13 @@ impl Render for MarketplaceView {
                                     .line_height(relative(1.5))
                                     .text_color(theme.muted_foreground)
                                     .child(match self.tab {
-                                        Tab::Mods => "Mods are the kinds of windows a canvas can have. They come \
-                                                      installed; uninstall the ones you don't use, and they leave \
-                                                      \u{201c}New window\u{201d}.",
-                                        Tab::LanguageServers => "Install a language server and editors for its \
-                                                      languages show errors as you type, complete as you go \
-                                                      (ctrl-space), and jump to definitions (F12 or ⌘-click). \
-                                                      Syntax highlighting works without one.",
+                                        Tab::Mods => t("Mods are the kinds of windows a canvas can have. They come \
+                                                        installed; uninstall the ones you don't use, and they leave \
+                                                        \u{201c}New window\u{201d}."),
+                                        Tab::LanguageServers => t("Install a language server and editors for its \
+                                                        languages show errors as you type, complete as you go \
+                                                        (ctrl-space), and jump to definitions (F12 or ⌘-click). \
+                                                        Syntax highlighting works without one."),
                                     }),
                             ),
                     )
@@ -279,7 +280,7 @@ impl Render for MarketplaceView {
                             .rounded(radius::LG)
                             .bg(theme.secondary)
                             .w(px(300.))
-                            .children([(Tab::Mods, "Mods"), (Tab::LanguageServers, "Language servers")].map(|(tab, label)| {
+                            .children([(Tab::Mods, t("Mods")), (Tab::LanguageServers, t("Language servers"))].map(|(tab, label)| {
                                 let active = self.tab == tab;
                                 div()
                                     .id(label)

@@ -63,22 +63,27 @@ impl Edge {
 /// opposite side stays put, and the window never gets smaller than the
 /// minimum.
 pub fn resized(frame: Frame, edge: Edge, dx: f32, dy: f32) -> Frame {
+    resized_to_min(frame, edge, dx, dy, (MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT))
+}
+
+/// [`resized`], with its own minimum size (a mark's).
+pub fn resized_to_min(frame: Frame, edge: Edge, dx: f32, dy: f32, (min_width, min_height): (f32, f32)) -> Frame {
     let mut next = frame;
     if edge.left() {
         let right = frame.x + frame.width;
-        next.x = (frame.x + dx).min(right - MIN_WINDOW_WIDTH);
+        next.x = (frame.x + dx).min(right - min_width);
         next.width = right - next.x;
     }
     if edge.right() {
-        next.width = (frame.width + dx).max(MIN_WINDOW_WIDTH);
+        next.width = (frame.width + dx).max(min_width);
     }
     if edge.top() {
         let bottom = frame.y + frame.height;
-        next.y = (frame.y + dy).min(bottom - MIN_WINDOW_HEIGHT);
+        next.y = (frame.y + dy).min(bottom - min_height);
         next.height = bottom - next.y;
     }
     if edge.bottom() {
-        next.height = (frame.height + dy).max(MIN_WINDOW_HEIGHT);
+        next.height = (frame.height + dy).max(min_height);
     }
     next
 }

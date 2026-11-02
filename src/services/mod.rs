@@ -1,6 +1,6 @@
 //! Everything without a UI. Most of it is the server's work (see
 //! `server.rs` and `rpc.rs`): shells, files, git (and its GitHub sign-in)
-//! and lino run there, so they keep going when the app quits. Language
+//! lino and SFTP connections run there, so they keep going when the app quits. Language
 //! servers run in the app.
 
 pub mod files;
@@ -17,6 +17,7 @@ pub mod projects;
 pub mod rpc;
 pub mod pty;
 pub mod server;
+pub mod sftp;
 pub mod shell;
 pub mod transport;
 
@@ -41,6 +42,7 @@ pub fn dispatch(method: &str, params: serde_json::Value) -> Result<serde_json::V
         .or_else(|| files::dispatch(method, params.clone()))
         .or_else(|| git::dispatch(method, params.clone()))
         .or_else(|| github::dispatch(method, params.clone()))
-        .or_else(|| lino::dispatch(method, params))
+        .or_else(|| lino::dispatch(method, params.clone()))
+        .or_else(|| sftp::dispatch(method, params))
         .unwrap_or_else(|| Err(format!("the server has no {method}")))
 }

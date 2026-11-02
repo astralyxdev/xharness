@@ -108,11 +108,18 @@ impl Element for Svg {
             cx,
             |style, window, cx| {
                 if let Some((path, color)) = self.path.as_ref().zip(style.text.color) {
+                    // (XHarness) Turned around where it's drawn: in a zoomed
+                    // subtree (`Window::with_zoom`) that isn't where it was
+                    // laid out, and a pivot at the laid-out center swings
+                    // the icon off its place.
+                    let drawn = window.element_transform();
                     let transformation = self
                         .transformation
                         .as_ref()
                         .map(|transformation| {
-                            transformation.into_matrix(bounds.center(), window.scale_factor())
+                            let mut transformation = *transformation;
+                            transformation.translate = transformation.translate.map(|length| length * drawn.scale);
+                            transformation.into_matrix(drawn.apply(bounds.center()), window.scale_factor())
                         })
                         .unwrap_or_default();
 

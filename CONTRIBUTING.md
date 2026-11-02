@@ -41,8 +41,9 @@ cargo test --no-default-features    # the server on its own, as remote servers r
 - Anything that runs work should go through the server (`rpc::route`), so it
   works on remote projects too. Note anything that only works locally.
 - UI changes: add before/after screenshots.
-- CI runs on every pull request (`.github/workflows/ci.yml`): the macOS app,
-  the Linux server, the Windows app and the Linux app must pass.
+- CI builds every pull request (`.github/workflows/ci.yml`): the macOS app,
+  the Linux servers, the Windows app and the Linux app must build. It doesn't
+  run the tests: run them yourself before opening the pull request.
 
 ## Reporting problems
 

@@ -18,6 +18,7 @@ use gpui::{
     KeyBinding, PathPromptOptions, SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 
+use crate::i18n::{t, tf};
 use crate::services::server::HostAddress;
 
 use crate::ui::actions::{Cancel, Confirm};
@@ -95,7 +96,7 @@ impl EventEmitter<ProjectDialogEvent> for ProjectDialog {}
 
 impl ProjectDialog {
     pub fn create(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let name = cx.new(|cx| TextInput::new("My project", cx));
+        let name = cx.new(|cx| TextInput::new(t("My project"), cx));
         let draft = Draft {
             name: String::new(),
             icon: IconName::Folder,
@@ -108,7 +109,7 @@ impl ProjectDialog {
 
     pub fn edit_project(project: &Project, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let text = project.name.clone();
-        let name = cx.new(|cx| TextInput::new("My project", cx).with_text(text));
+        let name = cx.new(|cx| TextInput::new(t("My project"), cx).with_text(text));
         let draft = Draft {
             name: String::new(),
             icon: project.icon,
@@ -126,7 +127,7 @@ impl ProjectDialog {
         cx: &mut Context<Self>,
     ) -> Self {
         let text = item.title.clone();
-        let name = cx.new(|cx| TextInput::new("Terminal", cx).with_text(text));
+        let name = cx.new(|cx| TextInput::new(t("Terminal"), cx).with_text(text));
         let draft = Draft {
             name: String::new(),
             icon: item.kind.icon(),
@@ -195,7 +196,7 @@ impl ProjectDialog {
             }
         };
         if folder_text.is_empty() {
-            self.check = Check::Failed(format!("Key for {} ({}). Now the project's folder there.", key.name, key.address()));
+            self.check = Check::Failed(tf("Key for {} ({}). Now the project's folder there.", &[&key.name, &key.address()]));
             self.check_task = None;
             cx.notify();
             return;
@@ -214,19 +215,17 @@ impl ProjectDialog {
                         let (latency, info) = crate::services::rpc::ping(Some(&server))?;
                         let folder = match folder_text.strip_prefix("~") {
                             Some(rest) => crate::services::files::home()
-                                .ok_or("The server has no home folder.")?
+                                .ok_or(t("The server has no home folder."))?
                                 .join(rest.trim_start_matches('/')),
                             None => PathBuf::from(&folder_text),
                         };
                         if crate::services::files::stamp(&folder).is_none() {
-                            return Err(format!("{} has no folder {}.", key.name, folder.display()));
+                            return Err(tf("{} has no folder {}.", &[&key.name, &folder.display()]));
                         }
                         let existing = crate::services::projects::existing_project(&folder);
-                        let summary = format!(
+                        let summary = tf(
                             "Connected to {} ({}) · {} ms",
-                            info.hostname,
-                            info.os,
-                            latency.as_millis().max(1)
+                            &[&info.hostname, &info.os, &latency.as_millis().max(1)],
                         );
                         Ok((summary, folder, existing))
                     })
@@ -312,7 +311,7 @@ impl ProjectDialog {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Choose".into()),
+            prompt: Some(t("Choose").into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             // Cancelled, or the panel failed: keep what we had.
@@ -384,17 +383,17 @@ impl ProjectDialog {
             .p_1()
             .rounded(radius::LG)
             .bg(theme.secondary)
-            .child(option("location-local", IconName::HardDrive, "This Mac", false))
-            .child(option("location-remote", IconName::Globe, "Remote server", true))
+            .child(option("location-local", IconName::HardDrive, t("This Mac"), false))
+            .child(option("location-remote", IconName::Globe, t("Remote server"), true))
     }
 
     fn render_remote(&self, theme: &Theme) -> impl IntoElement {
         let (text, color) = match &self.check {
             Check::Idle => (
-                "On the server, run `xharness --server --listen 0.0.0.0:38888` and paste the key it prints.".to_string(),
+                t("On the server, run `xharness --server --listen 0.0.0.0:38888` and paste the key it prints.").to_string(),
                 theme.muted_foreground,
             ),
-            Check::Checking => ("Connecting…".to_string(), theme.muted_foreground),
+            Check::Checking => (t("Connecting…").to_string(), theme.muted_foreground),
             Check::Ready { summary, folder, .. } => (format!("{summary} · {}", folder.display()), theme.tints.green.soft_foreground),
             Check::Failed(error) => (error.clone(), theme.tints.destructive.soft_foreground),
         };
@@ -402,15 +401,15 @@ impl ProjectDialog {
             .flex()
             .flex_col()
             .gap_5()
-            .child(field("Server key", self.key_input.clone()))
-            .child(field("Folder on the server", self.remote_folder.clone()))
+            .child(field(t("Server key"), self.key_input.clone()))
+            .child(field(t("Folder on the server"), self.remote_folder.clone()))
             .child(div().mt(px(-8.)).text_size(px(12.)).line_height(px(16.)).text_color(color).child(text))
     }
 
     fn render_folder_picker(&self, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
         let (path, chosen) = match &self.folder {
             Some(folder) => (display_path(folder), true),
-            None => ("No folder chosen".to_string(), false),
+            None => (t("No folder chosen").to_string(), false),
         };
         let hover_border = theme.border_active;
 
@@ -451,7 +450,7 @@ impl ProjectDialog {
                     .on_click(cx.listener(|this, _, window, cx| this.choose_folder(window, cx))),
             )
             .child(
-                Button::new("choose-folder", "Choose…")
+                Button::new("choose-folder", t("Choose…"))
                     .variant(Variant::Soft)
                     .on_click(cx.listener(|this, _, window, cx| this.choose_folder(window, cx))),
             )
@@ -550,34 +549,34 @@ impl Render for ProjectDialog {
         let (title, description, save_label) = match self.target {
             DialogTarget::NewProject => match self.existing {
                 Some(windows) => (
-                    "Open project",
+                    t("Open project"),
                     if windows == 1 {
-                        "This folder has an xharness project. Its window comes back as it was."
+                        t("This folder has an xharness project. Its window comes back as it was.")
                     } else {
-                        "This folder has an xharness project. Its windows come back as they were."
+                        t("This folder has an xharness project. Its windows come back as they were.")
                     },
-                    "Open project",
+                    t("Open project"),
                 ),
                 None if self.remote => (
-                    "New project",
-                    "A folder on a remote server: everything in the project runs there.",
-                    "Create project",
+                    t("New project"),
+                    t("A folder on a remote server: everything in the project runs there."),
+                    t("Create project"),
                 ),
                 None => (
-                    "New project",
-                    "Choose the project's folder. It's saved there, in .xharness, and its terminals start there.",
-                    "Create project",
+                    t("New project"),
+                    t("Choose the project's folder. It's saved there, in .xharness, and its terminals start there."),
+                    t("Create project"),
                 ),
             },
             DialogTarget::Project(_) => (
-                "Edit project",
-                "Change the name, folder, icon or color.",
-                "Save",
+                t("Edit project"),
+                t("Change the name, folder, icon or color."),
+                t("Save"),
             ),
             DialogTarget::Window { .. } => (
-                "Edit window",
-                "Change this window's name and color.",
-                "Save",
+                t("Edit window"),
+                t("Change this window's name and color."),
+                t("Save"),
             ),
         };
         let is_window = self.is_window();
@@ -605,19 +604,19 @@ impl Render for ProjectDialog {
                                 body.child(self.render_location(theme, cx))
                             })
                             .when(!is_window && !self.remote, |body| {
-                                body.child(field("Folder", self.render_folder_picker(theme, cx)))
+                                body.child(field(t("Folder"), self.render_folder_picker(theme, cx)))
                             })
                             .when(!is_window && self.remote, |body| body.child(self.render_remote(theme)))
-                            .child(field("Name", self.name.clone()))
+                            .child(field(t("Name"), self.name.clone()))
                             .when(!is_window, |body| {
-                                body.child(field("Icon", self.render_icon_picker(theme, cx)))
+                                body.child(field(t("Icon"), self.render_icon_picker(theme, cx)))
                             })
-                            .child(field("Color", self.render_color_picker(theme, cx))),
+                            .child(field(t("Color"), self.render_color_picker(theme, cx))),
                     )
                     .child(
                         ui::dialog_footer(theme)
                             .child(
-                                Button::new("cancel", "Cancel")
+                                Button::new("cancel", t("Cancel"))
                                     .variant(Variant::Soft)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.cancel(&Cancel, window, cx)

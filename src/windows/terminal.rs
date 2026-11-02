@@ -4,20 +4,23 @@
 //! - [`Session`] owns the PTY and the emulator. alacritty's I/O thread reads
 //!   the shell's output into the grid and reports events over a channel.
 //! - [`TerminalView`] is the GPUI view: focus, keyboard and IME input,
-//!   scrolling, paste. Every key goes to the shell, as in any terminal.
-//! - [`TerminalElement`] paints the grid: background runs, text runs shaped
-//!   on a fixed cell grid, and the cursor. It sizes itself from the rem size
-//!   around it, so a zoomed canvas scales the terminal without reflowing it.
+//!   scrolling, the mouse (selecting text, or reporting it to programs that
+//!   read it), copy and paste. Every key goes to the shell, as in any
+//!   terminal.
+//! - [`TerminalElement`] paints the grid: background runs, the selection,
+//!   text runs shaped on a fixed cell grid, and the cursor. It sizes itself
+//!   from the rem size around it, so a zoomed canvas scales the terminal
+//!   without reflowing it.
 //!
-//! Not yet: mouse selection and copy, mouse reporting (e.g. clicking in vim),
-//! and hyperlinks.
+//! Not yet: hyperlinks, and block (⌥-drag) selection.
 
 use std::{
     borrow::Cow,
+    collections::VecDeque,
     net::Shutdown,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::{Duration, Instant},
@@ -26,18 +29,21 @@ use std::{
 use alacritty_terminal::{
     event::{Event as TermEvent, EventListener, WindowSize},
     grid::{Dimensions, Scroll},
+    index::{Column, Line, Point as GridPoint, Side},
+    selection::{Selection, SelectionRange, SelectionType},
     sync::FairMutex,
-    term::{self, Term, TermMode, cell::Flags, color::Colors},
+    term::{self, Term, TermMode, cell::Flags, cell::LineLength, color::Colors, viewport_to_point},
     vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb},
 };
 
-use crate::windows::explorer::DraggedFiles;
+use crate::i18n::{t, tf};
 use crate::services::server::{self, Hello, HostAddress, Stream, frame};
 use futures::{StreamExt, channel::mpsc};
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, EventEmitter, ExternalPaths, FocusHandle, Focusable, Font, FontStyle, FontWeight,
-    GlobalElementId, Hsla, KeyBinding, KeyDownEvent, Keystroke, LayoutId, Pixels, Point,
+    App, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, EventEmitter, ExternalPaths, FocusHandle, Focusable, Font, FontStyle,
+    FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, KeyBinding, KeyDownEvent, Keystroke,
+    LayoutId, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
     ScrollWheelEvent, ShapedLine, SharedString, Size, Style, StrikethroughStyle, Task, TextRun,
     UTF16Selection, UnderlineStyle, Window, actions, div, fill, font, outline, point, prelude::*,
     px, relative, rems, size,
@@ -45,7 +51,7 @@ use gpui::{
 
 use crate::ui::theme::{FONT_MONO, Mode, Theme};
 
-actions!(terminal, [Paste]);
+actions!(terminal, [Paste, Copy, SelectAll]);
 
 const KEY_CONTEXT: &str = "Terminal";
 /// At 100% zoom; the canvas scales these.
@@ -54,8 +60,23 @@ const FONT_SIZE: f32 = 13.;
 const LINE_HEIGHT: f32 = 17.;
 const SCROLLBACK_LINES: usize = 10_000;
 
+/// ⌘C / ⌘V / ⌘A on macOS. Elsewhere ctrl-shift-C/V/A as in Linux
+/// terminals, plus ctrl-C and ctrl-V as in Windows Terminal: ctrl-C copies
+/// when something is selected and is ^C otherwise. ctrl-A stays ^A.
 pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("secondary-v", Paste, Some(KEY_CONTEXT))]);
+    let context = Some(KEY_CONTEXT);
+    cx.bind_keys([
+        KeyBinding::new("secondary-v", Paste, context),
+        KeyBinding::new("secondary-c", Copy, context),
+    ]);
+    #[cfg(target_os = "macos")]
+    cx.bind_keys([KeyBinding::new("cmd-a", SelectAll, context)]);
+    #[cfg(not(target_os = "macos"))]
+    cx.bind_keys([
+        KeyBinding::new("ctrl-shift-v", Paste, context),
+        KeyBinding::new("ctrl-shift-c", Copy, context),
+        KeyBinding::new("ctrl-shift-a", SelectAll, context),
+    ]);
 }
 
 // Session --------------------------------------------------------------------
@@ -133,10 +154,97 @@ impl Dimensions for GridSize {
 /// [`kill`]: Session::kill
 struct Session {
     term: Arc<FairMutex<Term<Listener>>>,
-    connection: Mutex<Stream>,
+    /// What goes to the host, sent in order by a writer thread.
+    outbox: Arc<Outbox>,
+    /// The connection, to hang up when the view lets go.
+    socket: Stream,
     size: GridSize,
     /// What the shell is doing, from its prompt marks (see [`ShellState`]).
     shell: Arc<AtomicU8>,
+}
+
+/// Input bigger than this goes to the host in several frames, so a huge
+/// paste stays under the host's frame limit and a kill can cut it short.
+const INPUT_CHUNK: usize = 16 << 10;
+
+/// Frames on their way to the host. A writer thread sends them, so the UI
+/// never waits on the socket: the host writes input to the shell as fast as
+/// the shell reads it, and a big paste into a busy program can take a while.
+#[derive(Default)]
+struct Outbox {
+    state: Mutex<OutboxState>,
+    wake: Condvar,
+}
+
+#[derive(Default)]
+struct OutboxState {
+    frames: VecDeque<(u8, Vec<u8>)>,
+    /// The kind of frame the writer is sending right now.
+    sending: Option<u8>,
+    /// The view let go: send what's left (a kill), then hang up.
+    closed: bool,
+}
+
+impl Outbox {
+    fn push(&self, kind: u8, payload: Vec<u8>) {
+        self.state.lock().unwrap().frames.push_back((kind, payload));
+        self.wake.notify_one();
+    }
+
+    fn push_input(&self, bytes: &[u8]) {
+        let mut state = self.state.lock().unwrap();
+        for chunk in bytes.chunks(INPUT_CHUNK) {
+            state.frames.push_back((frame::INPUT, chunk.to_vec()));
+        }
+        self.wake.notify_one();
+    }
+
+    /// Queues a kill. Input still waiting (the rest of a paste) is moot.
+    fn kill(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.frames.retain(|(kind, _)| *kind != frame::INPUT);
+        state.frames.push_back((frame::KILL, Vec::new()));
+        self.wake.notify_one();
+    }
+
+    /// No more frames. Whether a kill is still to be sent (the writer hangs
+    /// up after it); anything else waiting is dropped.
+    fn close(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        state.frames.retain(|(kind, _)| *kind == frame::KILL);
+        let killing = !state.frames.is_empty() || state.sending == Some(frame::KILL);
+        self.wake.notify_one();
+        killing
+    }
+
+    /// The next frame to send, waiting for one; `None` once closed and
+    /// empty.
+    fn next(&self) -> Option<(u8, Vec<u8>)> {
+        let mut state = self.state.lock().unwrap();
+        state.sending = None;
+        loop {
+            if let Some(frame) = state.frames.pop_front() {
+                state.sending = Some(frame.0);
+                return Some(frame);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self.wake.wait(state).unwrap();
+        }
+    }
+}
+
+/// Sends the outbox's frames until the view lets go (or the host does).
+fn send_frames(mut stream: Stream, outbox: Arc<Outbox>) {
+    while let Some((kind, payload)) = outbox.next() {
+        if server::write_frame(&mut stream, kind, &payload).is_err() {
+            return;
+        }
+    }
+    // Hanging up also wakes the reader thread.
+    stream.shutdown(Shutdown::Both).ok();
 }
 
 /// What the shell is doing, from the prompt marks our startup files print
@@ -234,23 +342,35 @@ impl Session {
             other => other.clone(),
         };
         let (stream, _) = server::attach(&address, &hello)
-            .map_err(|error| format!("Couldn't reach the server: {error}"))?;
-        let reader = stream
-            .try_clone()
-            .map_err(|error| format!("Couldn't read from the terminal: {error}"))?;
+            .map_err(|error| tf("Couldn't reach the server: {}", &[&error]))?;
+        let clone = || {
+            stream
+                .try_clone()
+                .map_err(|error| tf("Couldn't read from the terminal: {}", &[&error]))
+        };
+        let (reader, writer) = (clone()?, clone()?);
         let shell = Arc::new(AtomicU8::new(ShellState::Starting as u8));
+        let outbox = Arc::new(Outbox::default());
         {
             let (term, shell) = (term.clone(), shell.clone());
             std::thread::Builder::new()
                 .name("terminal reader".into())
                 .spawn(move || read_output(reader, term, shell, replaying, events))
-                .map_err(|error| format!("Couldn't start the terminal: {error}"))?;
+                .map_err(|error| tf("Couldn't start the terminal: {}", &[&error]))?;
+        }
+        {
+            let outbox = outbox.clone();
+            std::thread::Builder::new()
+                .name("terminal writer".into())
+                .spawn(move || send_frames(writer, outbox))
+                .map_err(|error| tf("Couldn't start the terminal: {}", &[&error]))?;
         }
 
         Ok((
             Self {
                 term,
-                connection: Mutex::new(stream),
+                outbox,
+                socket: stream,
                 size,
                 shell,
             },
@@ -262,10 +382,9 @@ impl Session {
         ShellState::from_u8(self.shell.load(Ordering::SeqCst))
     }
 
+    /// Sends input to the shell. It's queued, so this never blocks.
     fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
-        let bytes = bytes.into();
-        let mut connection = self.connection.lock().unwrap();
-        server::write_frame(&mut *connection, frame::INPUT, &bytes).ok();
+        self.outbox.push_input(&bytes.into());
     }
 
     fn resize(&mut self, size: GridSize, cell: Size<Pixels>) {
@@ -275,22 +394,21 @@ impl Session {
         self.size = size;
         self.term.lock().resize(size);
         let window = window_size(size, cell);
-        let mut connection = self.connection.lock().unwrap();
-        server::write_frame(&mut *connection, frame::RESIZE, &server::encode_size(window)).ok();
+        self.outbox.push(frame::RESIZE, server::encode_size(window).to_vec());
     }
 
     /// Ends the shell (closing the window, not quitting the app).
     fn kill(&self) {
-        let mut connection = self.connection.lock().unwrap();
-        server::write_frame(&mut *connection, frame::KILL, &[]).ok();
+        self.outbox.kill();
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // Detach. Shutting the socket down also wakes the reader thread.
-        if let Ok(connection) = self.connection.lock() {
-            connection.shutdown(Shutdown::Both).ok();
+        // Detach: hang up, which also wakes the reader thread. A kill on its
+        // way goes first; the writer hangs up after sending it.
+        if !self.outbox.close() {
+            self.socket.shutdown(Shutdown::Both).ok();
         }
     }
 }
@@ -370,14 +488,140 @@ pub struct TerminalView {
     exited: bool,
     /// Fractional lines of scroll not applied yet (trackpads scroll in pixels).
     scroll_lines: f32,
+    /// Where the grid was last painted, to tell programs which cell the
+    /// pointer is over.
+    cells: Option<CellGeometry>,
     /// IME composition in progress, if any.
     marked_text: Option<String>,
     /// Where the cursor was last painted, for placing the IME window.
     cursor_bounds: Option<Bounds<Pixels>>,
+    /// What the mouse is doing while a button is down.
+    gesture: Option<Gesture>,
+    /// The cell the last motion report named: moves within a cell aren't
+    /// reported again.
+    reported_cell: Option<(usize, usize)>,
+    /// Where the pointer is while dragging a selection, for scrolling while
+    /// it's past the top or bottom.
+    drag_position: Option<Point<Pixels>>,
+    /// Scrolls while a selection is dragged past an edge.
+    autoscroll: Option<Task<()>>,
+    /// Interrupts a running command for [`TerminalView::cd_into`].
+    _interrupting: Option<Task<()>>,
     _events: Option<Task<()>>,
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
+
+/// What a press of a mouse button turned into.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Gesture {
+    /// The click that focused this terminal. It selects only if you drag,
+    /// and it isn't reported to programs.
+    Focus { origin: Point<Pixels> },
+    /// Selecting text: dragging moves the selection's end.
+    Select,
+    /// A program reads the mouse: it gets the button's release, and drags
+    /// if it asked for them. `code` is the press's button code.
+    Report { button: MouseButton, code: u8 },
+}
+
+/// Mouse buttons 4 and 5, as xterm reports the wheel.
+const WHEEL_UP: u8 = 64;
+const WHEEL_DOWN: u8 = 65;
+/// Added to a button code for motion; 3 is "no button".
+const MOTION: u8 = 32;
+const NO_BUTTON: u8 = 3;
+
+/// xterm's code for a button (left 0, middle 1, right 2).
+fn button_code(button: MouseButton) -> Option<u8> {
+    match button {
+        MouseButton::Left => Some(0),
+        MouseButton::Middle => Some(1),
+        MouseButton::Right => Some(2),
+        _ => None,
+    }
+}
+
+/// The modifier bits of a mouse report. Shift isn't among them: shift
+/// makes the mouse select instead of reporting.
+fn modifier_code(modifiers: &Modifiers) -> u8 {
+    (if modifiers.alt { 8 } else { 0 }) + (if modifiers.control { 16 } else { 0 })
+}
+
+/// The grid's place on screen.
+#[derive(Clone, Copy, Debug)]
+struct CellGeometry {
+    origin: Point<Pixels>,
+    width: Pixels,
+    height: Pixels,
+    columns: usize,
+    lines: usize,
+}
+
+impl CellGeometry {
+    /// The cell (column, line) under `position`, from 0, kept inside the
+    /// grid.
+    fn cell_at(&self, position: Point<Pixels>) -> (usize, usize) {
+        let column = ((position.x - self.origin.x) / self.width).floor().max(0.) as usize;
+        let line = ((position.y - self.origin.y) / self.height).floor().max(0.) as usize;
+        (column.min(self.columns.saturating_sub(1)), line.min(self.lines.saturating_sub(1)))
+    }
+
+    /// The grid point under `position` (in the scrollback when it's scrolled
+    /// back by `display_offset`) and which half of its cell the pointer is
+    /// in, for selecting. Past an edge: the nearest cell.
+    fn selection_point(&self, position: Point<Pixels>, display_offset: usize) -> (GridPoint, Side) {
+        let (column, line) = self.cell_at(position);
+        let x = (position.x - self.origin.x) / self.width;
+        let side = if x >= self.columns as f32 || x - column as f32 > 0.5 {
+            Side::Right
+        } else {
+            Side::Left
+        };
+        (viewport_to_point(display_offset, GridPoint::new(line, Column(column))), side)
+    }
+
+    /// How many lines to scroll while a selection is dragged to `position`:
+    /// positive above the grid (back into the scrollback), negative below,
+    /// 0 inside. Further out scrolls faster.
+    fn lines_past_edge(&self, position: Point<Pixels>) -> i32 {
+        let top = self.origin.y;
+        let bottom = top + self.height * self.lines as f32;
+        let lines = |distance: Pixels| ((distance / self.height).ceil() as i32).clamp(1, 10);
+        if position.y < top {
+            lines(top - position.y)
+        } else if position.y >= bottom {
+            -lines(position.y - bottom + px(1.))
+        } else {
+            0
+        }
+    }
+}
+
+/// A mouse event for the program, in the encoding it asked for: SGR
+/// (`ESC[<b;x;yM`, `m` for a release), UTF-8, or xterm's original bytes
+/// (which can't say columns or lines past 223; those are reported at the
+/// edge, and a release doesn't say which button).
+fn mouse_report(button: u8, column: usize, line: usize, pressed: bool, mode: TermMode) -> Vec<u8> {
+    let (x, y) = (column + 1, line + 1);
+    if mode.contains(TermMode::SGR_MOUSE) {
+        let end = if pressed { 'M' } else { 'm' };
+        return format!("\x1b[<{button};{x};{y}{end}").into_bytes();
+    }
+    let button = if pressed { button } else { (button & !0b11) | NO_BUTTON };
+    let mut report = b"\x1b[M".to_vec();
+    report.push(32 + button);
+    for value in [x, y] {
+        if mode.contains(TermMode::UTF8_MOUSE) {
+            let code = char::from_u32((32 + value).min(2047) as u32).unwrap_or(' ');
+            let mut buffer = [0u8; 4];
+            report.extend_from_slice(code.encode_utf8(&mut buffer).as_bytes());
+        } else {
+            report.push((32 + value).min(255) as u8);
+        }
+    }
+    report
+}
 
 impl Focusable for TerminalView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -398,8 +642,14 @@ impl TerminalView {
             focus_handle: cx.focus_handle(),
             exited: false,
             scroll_lines: 0.,
+            cells: None,
             marked_text: None,
             cursor_bounds: None,
+            gesture: None,
+            reported_cell: None,
+            drag_position: None,
+            autoscroll: None,
+            _interrupting: None,
             _events: None,
         };
         this.attach(cx);
@@ -412,6 +662,8 @@ impl TerminalView {
             Err(error) => (Err(error.into()), None),
         };
         self.session = session;
+        self.gesture = None;
+        self.autoscroll = None;
         self._events = events.map(|mut events| {
             cx.spawn(async move |this, cx| {
                 while let Some(event) = events.next().await {
@@ -446,7 +698,7 @@ impl TerminalView {
                 }
             }
             SessionEvent::TakenOver => {
-                self.session = Err("This terminal is open in another xharness window.".into());
+                self.session = Err(t("This terminal is open in another xharness window.").into());
                 cx.notify();
             }
             SessionEvent::Disconnected => {
@@ -456,7 +708,7 @@ impl TerminalView {
                     .reconnected_at
                     .is_some_and(|at| at.elapsed() < Duration::from_secs(5));
                 if recently {
-                    self.session = Err("Lost the terminal session host.".into());
+                    self.session = Err(t("Lost the terminal session host.").into());
                     cx.notify();
                 } else {
                     self.reconnected_at = Some(Instant::now());
@@ -565,10 +817,15 @@ impl TerminalView {
         }
     }
 
-    /// Sends user input, jumping back to the live screen first.
+    /// Sends user input, jumping back to the live screen first. Typing
+    /// clears the selection, as in other terminals.
     fn input(&mut self, bytes: impl Into<Cow<'static, [u8]>>, cx: &mut Context<Self>) {
         if let Ok(session) = &self.session {
-            session.term.lock().scroll_display(Scroll::Bottom);
+            {
+                let mut term = session.term.lock();
+                term.scroll_display(Scroll::Bottom);
+                term.selection = None;
+            }
             session.write(bytes);
             cx.notify();
         }
@@ -589,29 +846,320 @@ impl TerminalView {
         }
     }
 
-    fn type_paths(&mut self, paths: &[std::path::PathBuf], cx: &mut Context<Self>) {
-        let mut text = paths
-            .iter()
-            .map(|path| shell_quote(&path.to_string_lossy()))
-            .collect::<Vec<_>>()
-            .join(" ");
+    /// Types `paths` at the prompt, quoted for the shell and separated by
+    /// spaces, with a space after, without running anything (what dropping
+    /// files on Terminal does). It goes in as a paste, so programs that take
+    /// pastes (Claude Code, for one) see one.
+    pub fn insert_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        let mut text = paths.iter().map(|path| quote_path(path)).collect::<Vec<_>>().join(" ");
         text.push(' ');
-        self.input(text.into_bytes(), cx);
+        self.paste_text(&text, cx);
+    }
+
+    /// Takes the shell to `folder`, as if you typed `cd` there. A command
+    /// that's running is interrupted first: ^C (again every half second;
+    /// some programs, Claude Code for one, want two), then ^\ as a last try.
+    /// The `cd` is typed once the shell is back at its prompt, or after the
+    /// last try, unless a full-screen program (vim, say) still has the
+    /// screen: keys typed there would edit something.
+    pub fn cd_into(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
+        let command = cd_command(&folder);
+        if !self.running() {
+            self._interrupting = None;
+            self.input(command.into_bytes(), cx);
+            return;
+        }
+        self.input(Interrupt::INTERRUPT, cx);
+        let mut interrupt = Interrupt::new(Instant::now());
+        self._interrupting = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Interrupt::POLL).await;
+                let step = this.update(cx, |this, _| {
+                    let step = interrupt.step(Instant::now(), this.running());
+                    if let InterruptStep::Send(bytes) = step {
+                        this.write(bytes);
+                    }
+                    step
+                });
+                match step {
+                    Ok(InterruptStep::Done) => break,
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+            this.update(cx, |this, cx| {
+                if this.running() && this.mode().contains(TermMode::ALT_SCREEN) {
+                    return;
+                }
+                this.input(command.into_bytes(), cx);
+            })
+            .ok();
+        }));
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
-        let text = if self.mode().contains(TermMode::BRACKETED_PASTE) {
-            // Strip any bracket sequences in the text so it can't end the
-            // paste early.
-            let text = text.replace("\x1b[200~", "").replace("\x1b[201~", "");
-            format!("\x1b[200~{text}\x1b[201~")
-        } else {
-            text.replace("\r\n", "\r").replace('\n', "\r")
+        self.paste_text(&text, cx);
+    }
+
+    /// Sends `text` as a paste: line breaks as returns, and bracketed when
+    /// the program asked (so a shell shows it without running it). The
+    /// selection goes, and the screen jumps to the bottom. The writer
+    /// thread sends it, so a big paste doesn't hold up the window.
+    fn paste_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if text.is_empty() {
+            return;
+        }
+        let bracketed = self.mode().contains(TermMode::BRACKETED_PASTE);
+        self.input(paste_bytes(text, bracketed), cx);
+    }
+
+    /// Copies the selection. With nothing selected, ⌘C does nothing; on
+    /// other systems the key goes on, so ctrl-C is ^C.
+    fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.selected_text() else {
+            if !cfg!(target_os = "macos") {
+                cx.propagate();
+            }
+            return;
         };
-        self.input(text.into_bytes(), cx);
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        // Like Windows Terminal: once copied, ctrl-C is ^C again.
+        if !cfg!(target_os = "macos") {
+            self.clear_selection(cx);
+        }
+    }
+
+    /// Selects everything, the scrollback included.
+    fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        if let Ok(session) = &self.session {
+            let mut term = session.term.lock();
+            term.selection = Some(select_all(&term));
+            cx.notify();
+        }
+    }
+
+    /// The selected text, if any.
+    pub fn selected_text(&self) -> Option<String> {
+        let session = self.session.as_ref().ok()?;
+        session.term.lock().selection_to_string().filter(|text| !text.is_empty())
+    }
+
+    fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        if let Ok(session) = &self.session {
+            session.term.lock().selection = None;
+            cx.notify();
+        }
+    }
+
+    // Mouse --------------------------------------------------------------------
+
+    fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(cells), Ok(_)) = (self.cells, &self.session) else {
+            return;
+        };
+        self.autoscroll = None;
+        self.drag_position = None;
+        // The click that picks this terminal (another window had the
+        // keyboard) leaves the selection and the program alone.
+        if !self.focus_handle.is_focused(window) {
+            self.gesture = (event.button == MouseButton::Left).then_some(Gesture::Focus { origin: event.position });
+            return;
+        }
+        let mode = self.mode();
+        // Programs that read the mouse get it, unless shift is down (as in
+        // iTerm and xterm).
+        if mode.intersects(TermMode::MOUSE_MODE) && !event.modifiers.shift {
+            let Some(button) = button_code(event.button) else {
+                return;
+            };
+            let code = button + modifier_code(&event.modifiers);
+            let (column, line) = cells.cell_at(event.position);
+            self.write(mouse_report(code, column, line, true, mode));
+            self.reported_cell = Some((column, line));
+            self.gesture = Some(Gesture::Report { button: event.button, code });
+            if event.button == MouseButton::Left {
+                self.clear_selection(cx);
+            }
+            return;
+        }
+        if event.button != MouseButton::Left {
+            return;
+        }
+        // Shift-click extends the selection; a double click selects words,
+        // a triple click lines.
+        let extend = event.modifiers.shift && event.click_count <= 1;
+        self.select_at(event.position, event.click_count, extend, cx);
+        self.gesture = Some(Gesture::Select);
+    }
+
+    /// Starts a selection at `position` (or moves the end of the one there
+    /// is, if `extend`).
+    fn select_at(&mut self, position: Point<Pixels>, click_count: usize, extend: bool, cx: &mut Context<Self>) {
+        let (Some(cells), Ok(session)) = (self.cells, &self.session) else {
+            return;
+        };
+        let mut term = session.term.lock();
+        let (point, side) = cells.selection_point(position, term.grid().display_offset());
+        match term.selection.as_mut() {
+            Some(selection) if extend => selection.update(point, side),
+            _ => term.selection = Some(Selection::new(selection_type(click_count), point, side)),
+        }
+        cx.notify();
+    }
+
+    /// Moves the end of the selection to `position`.
+    fn drag_selection(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let (Some(cells), Ok(session)) = (self.cells, &self.session) else {
+            return;
+        };
+        let mut term = session.term.lock();
+        let (point, side) = cells.selection_point(position, term.grid().display_offset());
+        if let Some(selection) = term.selection.as_mut() {
+            selection.update(point, side);
+            cx.notify();
+        }
+    }
+
+    /// The pointer moved, anywhere in the window (`hovered`: over this
+    /// terminal).
+    fn mouse_move(&mut self, event: &MouseMoveEvent, hovered: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(cells) = self.cells else {
+            return;
+        };
+        match self.gesture {
+            Some(Gesture::Select) => {
+                // The release happened somewhere we didn't hear about.
+                if event.pressed_button != Some(MouseButton::Left) {
+                    self.end_selection(cx);
+                    return;
+                }
+                self.drag_position = Some(event.position);
+                self.drag_selection(event.position, cx);
+                if cells.lines_past_edge(event.position) != 0 && self.autoscroll.is_none() {
+                    self.start_autoscroll(cx);
+                }
+            }
+            Some(Gesture::Focus { origin }) => {
+                if event.pressed_button != Some(MouseButton::Left) {
+                    self.gesture = None;
+                    return;
+                }
+                let moved = event.position - origin;
+                if f32::from(moved.x.abs()).max(f32::from(moved.y.abs())) > 3. {
+                    // A drag after all: select from where it started.
+                    self.select_at(origin, 1, false, cx);
+                    self.gesture = Some(Gesture::Select);
+                    self.mouse_move(event, hovered, window, cx);
+                }
+            }
+            Some(Gesture::Report { code, .. }) => {
+                if event.pressed_button.is_none() {
+                    self.gesture = None;
+                    return;
+                }
+                let mode = self.mode();
+                if mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION) {
+                    self.report_motion(code + MOTION, event.position, mode);
+                }
+            }
+            None => {
+                // Programs that asked for every move get them while the
+                // pointer is over a terminal you're typing in.
+                let mode = self.mode();
+                if hovered
+                    && mode.contains(TermMode::MOUSE_MOTION)
+                    && event.pressed_button.is_none()
+                    && !event.modifiers.shift
+                    && !cx.has_active_drag()
+                    && self.focus_handle.is_focused(window)
+                {
+                    let code = NO_BUTTON + MOTION + modifier_code(&event.modifiers);
+                    self.report_motion(code, event.position, mode);
+                }
+            }
+        }
+    }
+
+    /// Reports a move to the program, if it reached another cell.
+    fn report_motion(&mut self, code: u8, position: Point<Pixels>, mode: TermMode) {
+        let Some(cells) = self.cells else {
+            return;
+        };
+        let cell = cells.cell_at(position);
+        if self.reported_cell != Some(cell) {
+            self.reported_cell = Some(cell);
+            self.write(mouse_report(code, cell.0, cell.1, true, mode));
+        }
+    }
+
+    fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        match self.gesture {
+            Some(Gesture::Report { button, code }) if button == event.button => {
+                self.gesture = None;
+                let mode = self.mode();
+                if let Some(cells) = self.cells
+                    && mode.intersects(TermMode::MOUSE_MODE)
+                {
+                    let (column, line) = cells.cell_at(event.position);
+                    self.write(mouse_report(code, column, line, false, mode));
+                }
+            }
+            Some(Gesture::Select) if event.button == MouseButton::Left => self.end_selection(cx),
+            Some(Gesture::Focus { .. }) if event.button == MouseButton::Left => self.gesture = None,
+            _ => {}
+        }
+    }
+
+    /// The button's up: a click that didn't drag leaves nothing selected.
+    fn end_selection(&mut self, cx: &mut Context<Self>) {
+        self.gesture = None;
+        self.autoscroll = None;
+        self.drag_position = None;
+        if let Ok(session) = &self.session {
+            let mut term = session.term.lock();
+            if term.selection.as_ref().is_some_and(|selection| selection.is_empty()) {
+                term.selection = None;
+            }
+        }
+        cx.notify();
+    }
+
+    /// While a selection is dragged past the top or bottom, scrolls (and
+    /// keeps selecting) until the pointer comes back or the button's up.
+    fn start_autoscroll(&mut self, cx: &mut Context<Self>) {
+        self.autoscroll = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(50)).await;
+                let scrolling = this.update(cx, |this, cx| this.autoscroll_step(cx));
+                if !matches!(scrolling, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn autoscroll_step(&mut self, cx: &mut Context<Self>) -> bool {
+        let (Some(Gesture::Select), Some(position), Some(cells), Ok(session)) =
+            (self.gesture, self.drag_position, self.cells, &self.session)
+        else {
+            self.autoscroll = None;
+            return false;
+        };
+        let lines = cells.lines_past_edge(position);
+        if lines == 0 {
+            self.autoscroll = None;
+            return false;
+        }
+        session.term.lock().scroll_display(Scroll::Delta(lines));
+        self.drag_selection(position, cx);
+        cx.notify();
+        true
     }
 
     fn scroll_wheel(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -633,7 +1181,17 @@ impl TerminalView {
         self.scroll_lines -= lines as f32;
 
         let mode = self.mode();
-        if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
+        if mode.intersects(TermMode::MOUSE_MODE) && !event.modifiers.shift {
+            // A program that reads the mouse (Claude Code, vim with
+            // mouse=a, htop) gets the wheel itself and scrolls what it
+            // shows. Shift-scrolling still scrolls the terminal, as in
+            // other terminals.
+            let (column, line) = self.cells.map_or((0, 0), |cells| cells.cell_at(event.position));
+            let direction = if lines > 0 { WHEEL_UP } else { WHEEL_DOWN };
+            let button = direction + modifier_code(&event.modifiers);
+            let report = mouse_report(button, column, line, true, mode);
+            self.write(report.repeat(lines.unsigned_abs() as usize));
+        } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
             // Full-screen apps (less, vim) have no scrollback; like other
             // terminals, scrolling sends arrow keys instead.
             let key: &[u8] = match (lines > 0, mode.contains(TermMode::APP_CURSOR)) {
@@ -645,6 +1203,11 @@ impl TerminalView {
             self.write(key.repeat(lines.unsigned_abs() as usize));
         } else if let Ok(session) = &self.session {
             session.term.lock().scroll_display(Scroll::Delta(lines));
+            // Scrolling while dragging a selection keeps it under the
+            // pointer.
+            if self.gesture == Some(Gesture::Select) {
+                self.drag_selection(event.position, cx);
+            }
             cx.notify();
         }
     }
@@ -653,6 +1216,12 @@ impl TerminalView {
 impl Render for TerminalView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::global(cx);
+        // Over a program that reads the mouse, the pointer is an arrow.
+        let cursor = if self.mode().intersects(TermMode::MOUSE_MODE) {
+            CursorStyle::Arrow
+        } else {
+            CursorStyle::IBeam
+        };
 
         div()
             .id("terminal")
@@ -661,12 +1230,18 @@ impl Render for TerminalView {
             .size_full()
             .px_2()
             .py_1()
-            .cursor(CursorStyle::IBeam)
+            .cursor(cursor)
             .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::select_all))
             .on_key_down(cx.listener(Self::key_down))
-            // Files dropped on a terminal type their paths, as in Terminal.
-            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| this.type_paths(paths.paths(), cx)))
-            .on_drop(cx.listener(|this, files: &DraggedFiles, _, cx| this.type_paths(&files.0, cx)))
+            // On the padding too, so a click there picks the nearest cell.
+            // Moves and releases are heard by the grid (see
+            // `TerminalElement::paint`), wherever the pointer goes.
+            .on_any_mouse_down(cx.listener(Self::mouse_down))
+            // Files dropped from Finder type their paths, as in Terminal.
+            // Files dragged from an Explorer go on to the canvas.
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| this.insert_paths(paths.paths(), cx)))
             .on_scroll_wheel(cx.listener(Self::scroll_wheel))
             .map(|terminal| match &self.session {
                 Ok(_) => terminal.child(TerminalElement { view: cx.entity() }),
@@ -679,6 +1254,86 @@ impl Render for TerminalView {
     }
 }
 
+// Selection ------------------------------------------------------------------
+
+/// A single click selects characters, a double click words, a triple click
+/// lines.
+fn selection_type(click_count: usize) -> SelectionType {
+    match click_count {
+        0 | 1 => SelectionType::Simple,
+        2 => SelectionType::Semantic,
+        _ => SelectionType::Lines,
+    }
+}
+
+/// Everything: the scrollback's first line to the last one with text (the
+/// empty screen below it would only copy as blank lines).
+fn select_all<T>(term: &Term<T>) -> Selection {
+    let top = term.topmost_line();
+    let mut bottom = term.bottommost_line();
+    while bottom > top && term.grid()[bottom].line_length() == Column(0) {
+        bottom = Line(bottom.0 - 1);
+    }
+    let mut selection = Selection::new(SelectionType::Simple, GridPoint::new(top, Column(0)), Side::Left);
+    selection.update(GridPoint::new(bottom, term.last_column()), Side::Right);
+    selection
+}
+
+/// The selected cells of each visible row: (row, first column, last
+/// column), for painting.
+fn selection_rows(
+    range: &SelectionRange,
+    display_offset: usize,
+    lines: usize,
+    columns: usize,
+) -> Vec<(usize, usize, usize)> {
+    let last_column = columns.saturating_sub(1);
+    (0..lines)
+        .filter_map(|row| {
+            let line = Line(row as i32 - display_offset as i32);
+            if line < range.start.line || line > range.end.line {
+                return None;
+            }
+            let (first, last) = if range.is_block {
+                (range.start.column.0, range.end.column.0)
+            } else {
+                (
+                    if line == range.start.line { range.start.column.0 } else { 0 },
+                    if line == range.end.line { range.end.column.0 } else { last_column },
+                )
+            };
+            let last = last.min(last_column);
+            (first <= last).then_some((row, first, last))
+        })
+        .collect()
+}
+
+// Pasting and typing for the shell -------------------------------------------
+
+/// What a paste sends: line breaks (CRLF or LF) as returns, which is what
+/// the Return key sends, and, when the program turned bracketed paste on,
+/// the text between `ESC[200~` and `ESC[201~`. Brackets inside the text are
+/// taken out, so it can't end the paste early and run what follows.
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let text = text.replace("\r\n", "\r").replace('\n', "\r");
+    if !bracketed {
+        return text.into_bytes();
+    }
+    format!("{PASTE_START}{}{PASTE_END}", strip_paste_brackets(text)).into_bytes()
+}
+
+const PASTE_START: &str = "\x1b[200~";
+const PASTE_END: &str = "\x1b[201~";
+
+/// `text` with no bracketed-paste markers in it, including ones that only
+/// appear once another is taken out (`ESC[20` `ESC[201~` `1~`).
+fn strip_paste_brackets(mut text: String) -> String {
+    while text.contains(PASTE_START) || text.contains(PASTE_END) {
+        text = text.replace(PASTE_START, "").replace(PASTE_END, "");
+    }
+    text
+}
+
 /// `text` as one shell word: as is when it's only safe characters, else in
 /// single quotes.
 fn shell_quote(text: &str) -> String {
@@ -687,6 +1342,102 @@ fn shell_quote(text: &str) -> String {
         text.to_string()
     } else {
         format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
+/// `text` as one PowerShell argument: as is when it's only safe characters,
+/// else in single quotes (where only `'` is special, written twice).
+fn powershell_quote(text: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "_-./\\:".contains(c);
+    if !text.is_empty() && text.chars().all(safe) {
+        text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', "''"))
+    }
+}
+
+/// A path, quoted for this system's shell.
+fn quote_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) { powershell_quote(&text) } else { shell_quote(&text) }
+}
+
+/// What [`TerminalView::cd_into`] types: clear the line, then go to
+/// `folder`. The leading space keeps it out of history where the shell
+/// skips such lines.
+fn cd_command(folder: &Path) -> String {
+    let folder = folder.to_string_lossy();
+    if cfg!(windows) { powershell_cd(&folder) } else { posix_cd(&folder) }
+}
+
+/// ^E ^U (end of line, then delete to its start: the whole line in zsh and
+/// bash), then `cd`.
+fn posix_cd(folder: &str) -> String {
+    format!("\x05\x15 cd -- '{}'\r", folder.replace('\'', "'\\''"))
+}
+
+/// ctrl-End, ctrl-Home (PSReadLine deletes to the end, then to the start),
+/// then `Set-Location`.
+fn powershell_cd(folder: &str) -> String {
+    format!("\x1b[1;5F\x1b[1;5H Set-Location -LiteralPath '{}'\r", folder.replace('\'', "''"))
+}
+
+/// How [`TerminalView::cd_into`] gets a running command to stop.
+struct Interrupt {
+    started: Instant,
+    last_sent: Instant,
+    quit_sent: bool,
+}
+
+#[derive(Debug, PartialEq)]
+enum InterruptStep {
+    /// Still running; wait.
+    Wait,
+    /// Still running; send this.
+    Send(&'static [u8]),
+    /// At a prompt (or given up): type the command.
+    Done,
+}
+
+impl Interrupt {
+    /// How often to look.
+    const POLL: Duration = Duration::from_millis(100);
+    /// ^C again this often.
+    const RESEND: Duration = Duration::from_millis(500);
+    /// Then the last try.
+    const QUIT_AFTER: Duration = Duration::from_secs(3);
+    /// Then give up.
+    const GIVE_UP_AFTER: Duration = Duration::from_secs(4);
+    const INTERRUPT: &'static [u8] = b"\x03";
+    /// ^\ (SIGQUIT). Windows has no such signal; ^C once more there.
+    const QUIT: &'static [u8] = if cfg!(windows) { b"\x03" } else { b"\x1c" };
+
+    /// Right after the first ^C went.
+    fn new(now: Instant) -> Self {
+        Self {
+            started: now,
+            last_sent: now,
+            quit_sent: false,
+        }
+    }
+
+    fn step(&mut self, now: Instant, running: bool) -> InterruptStep {
+        let elapsed = now.duration_since(self.started);
+        if !running || elapsed >= Self::GIVE_UP_AFTER {
+            return InterruptStep::Done;
+        }
+        if self.quit_sent {
+            return InterruptStep::Wait;
+        }
+        if elapsed >= Self::QUIT_AFTER {
+            self.quit_sent = true;
+            return InterruptStep::Send(Self::QUIT);
+        }
+        if now.duration_since(self.last_sent) >= Self::RESEND {
+            self.last_sent = now;
+            return InterruptStep::Send(Self::INTERRUPT);
+        }
+        InterruptStep::Wait
     }
 }
 
@@ -998,8 +1749,13 @@ struct PaintCursor {
 }
 
 struct TerminalPrepaint {
+    /// Where the pointer counts as over the terminal.
+    hitbox: Hitbox,
     line_height: Pixels,
     backgrounds: Vec<(Bounds<Pixels>, Hsla)>,
+    /// The selection's cells, row by row, and its color.
+    selection: Vec<Bounds<Pixels>>,
+    selection_color: Hsla,
     lines: Vec<(Point<Pixels>, ShapedLine)>,
     cursor: Option<PaintCursor>,
 }
@@ -1072,14 +1828,30 @@ impl Element for TerminalElement {
             lines: ((bounds.size.height / line_height + 1e-3).floor() as usize).max(1),
         };
         let unzoomed_cell = size(base_cell_width, px(LINE_HEIGHT));
-        self.view.update(cx, |view, _| view.resize(grid, unzoomed_cell));
+        let cells = CellGeometry {
+            origin: bounds.origin,
+            width: cell_width,
+            height: line_height,
+            columns: grid.columns,
+            lines: grid.lines,
+        };
+        self.view.update(cx, |view, _| {
+            view.resize(grid, unzoomed_cell);
+            view.cells = Some(cells);
+        });
 
+        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         let view = self.view.read(cx);
         let focused = view.focus_handle.is_focused(window);
+        // Dimmer while another window has the keyboard, as in macOS.
+        let selection_color = theme.tints.blue.base.opacity(if focused { 0.3 } else { 0.15 });
         let Ok(session) = &view.session else {
             return TerminalPrepaint {
+                hitbox,
                 line_height,
                 backgrounds: Vec::new(),
+                selection: Vec::new(),
+                selection_color,
                 lines: Vec::new(),
                 cursor: None,
             };
@@ -1087,6 +1859,7 @@ impl Element for TerminalElement {
         let term = session.term.lock();
         let content = term.renderable_content();
         let offset = content.display_offset as i32;
+        let selected = content.selection;
         let default_bg = theme.background;
         let cell_origin = |row: usize, column: usize| {
             point(
@@ -1251,6 +2024,23 @@ impl Element for TerminalElement {
             })
             .collect();
 
+        let selection = selected
+            .map(|range| selection_rows(&range, content.display_offset, grid.lines, grid.columns))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(row, first, mut last)| {
+                // A wide character the selection ends on is selected whole.
+                let line = Line(row as i32 - offset);
+                if last + 1 < grid.columns
+                    && term.grid()[GridPoint::new(line, Column(last))].flags.contains(Flags::WIDE_CHAR)
+                {
+                    last += 1;
+                }
+                let cells = (last - first + 1) as f32;
+                Bounds::new(cell_origin(row, first), size(cell_width * cells, line_height))
+            })
+            .collect();
+
         // The cursor, unless it's hidden or scrolled out of view.
         let cursor_row = content.cursor.point.line.0 + offset;
         let cursor = (content.cursor.shape != CursorShape::Hidden
@@ -1290,8 +2080,11 @@ impl Element for TerminalElement {
         });
 
         TerminalPrepaint {
+            hitbox,
             line_height,
             backgrounds,
+            selection,
+            selection_color,
             lines,
             cursor,
         }
@@ -1314,12 +2107,36 @@ impl Element for TerminalElement {
             cx,
         );
 
+        // Moves and releases anywhere in the window: a drag that started
+        // here keeps selecting (or reporting) when the pointer leaves.
+        // Presses are the view's own (see `TerminalView::mouse_down`).
+        let (view, hitbox) = (self.view.clone(), prepaint.hitbox.clone());
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble {
+                return;
+            }
+            let hovered = hitbox.is_hovered(window);
+            if hovered || view.read(cx).gesture.is_some() {
+                view.update(cx, |view, cx| view.mouse_move(event, hovered, window, cx));
+            }
+        });
+        let view = self.view.clone();
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+            if phase == DispatchPhase::Bubble && view.read(cx).gesture.is_some() {
+                view.update(cx, |view, cx| view.mouse_up(event, window, cx));
+            }
+        });
+
         let line_height = prepaint.line_height;
         // Beam and underline cursors: 2px at 100%, never thinner than 1px.
         let stroke = (line_height / LINE_HEIGHT * 2.).max(px(1.));
         window.paint_layer(bounds, |window| {
             for (bounds, color) in prepaint.backgrounds.drain(..) {
                 window.paint_quad(fill(bounds, color));
+            }
+            // Over the cells' colors, under the text.
+            for bounds in prepaint.selection.drain(..) {
+                window.paint_quad(fill(bounds, prepaint.selection_color));
             }
             for (origin, line) in prepaint.lines.drain(..) {
                 line.paint(origin, line_height, window, cx).ok();
@@ -1359,11 +2176,292 @@ mod tests {
 
     use crate::services::server::tests::shell_command;
 
+    /// Programs that read the mouse get the wheel in the encoding they
+    /// asked for, at the cell under the pointer.
+    #[test]
+    fn the_wheel_is_reported_to_programs_that_read_the_mouse() {
+        use alacritty_terminal::term::TermMode;
+        use super::{CellGeometry, WHEEL_DOWN, WHEEL_UP, mouse_report};
+        let sgr = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        assert_eq!(mouse_report(WHEEL_UP, 0, 0, true, sgr), b"\x1b[<64;1;1M");
+        assert_eq!(mouse_report(WHEEL_DOWN, 79, 23, true, sgr), b"\x1b[<65;80;24M");
+        // xterm's bytes: 32 + button, 32 + column, 32 + line.
+        assert_eq!(mouse_report(WHEEL_UP, 9, 4, true, TermMode::MOUSE_REPORT_CLICK), b"\x1b[M\x60\x2a\x25");
+        let utf8 = TermMode::MOUSE_REPORT_CLICK | TermMode::UTF8_MOUSE;
+        assert_eq!(mouse_report(WHEEL_DOWN, 299, 0, true, utf8), "\x1b[Ma\u{14c}!".as_bytes());
+
+        let cells = CellGeometry {
+            origin: gpui::point(gpui::px(10.), gpui::px(20.)),
+            width: gpui::px(8.),
+            height: gpui::px(16.),
+            columns: 80,
+            lines: 24,
+        };
+        assert_eq!(cells.cell_at(gpui::point(gpui::px(10.), gpui::px(20.))), (0, 0));
+        assert_eq!(cells.cell_at(gpui::point(gpui::px(35.), gpui::px(52.))), (3, 2));
+        // Outside the grid: its nearest edge.
+        assert_eq!(cells.cell_at(gpui::point(gpui::px(0.), gpui::px(9000.))), (0, 23));
+    }
+
+    /// Clicks, releases and drags, for programs that read the mouse.
+    #[test]
+    fn buttons_are_reported_to_programs_that_read_the_mouse() {
+        use alacritty_terminal::term::TermMode;
+        use super::{MOTION, NO_BUTTON, button_code, modifier_code, mouse_report};
+        let left = button_code(gpui::MouseButton::Left).unwrap();
+        let right = button_code(gpui::MouseButton::Right).unwrap();
+        let sgr = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        // SGR says which button was released, with a lowercase `m`.
+        assert_eq!(mouse_report(left, 4, 2, true, sgr), b"\x1b[<0;5;3M");
+        assert_eq!(mouse_report(left, 4, 2, false, sgr), b"\x1b[<0;5;3m");
+        assert_eq!(mouse_report(right, 0, 0, false, sgr), b"\x1b[<2;1;1m");
+        // A drag adds 32; moving with no button down is 3 + 32.
+        assert_eq!(mouse_report(left + MOTION, 6, 2, true, sgr), b"\x1b[<32;7;3M");
+        assert_eq!(mouse_report(NO_BUTTON + MOTION, 0, 0, true, sgr), b"\x1b[<35;1;1M");
+        // ⌥ and ctrl ride along; xterm's own encoding releases "button 3".
+        let modifiers = gpui::Modifiers { alt: true, control: true, ..Default::default() };
+        assert_eq!(modifier_code(&modifiers), 24);
+        let normal = TermMode::MOUSE_REPORT_CLICK;
+        assert_eq!(mouse_report(right + 8, 0, 0, true, normal), b"\x1b[M\x2a\x21\x21");
+        assert_eq!(mouse_report(right + 8, 0, 0, false, normal), b"\x1b[M\x2b\x21\x21");
+    }
+
     #[test]
     fn dropped_paths_are_quoted_for_the_shell() {
         assert_eq!(super::shell_quote("/tmp/a.txt"), "/tmp/a.txt");
         assert_eq!(super::shell_quote("/tmp/my file.txt"), "'/tmp/my file.txt'");
         assert_eq!(super::shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(super::powershell_quote("C:\\Users\\me\\a.txt"), "C:\\Users\\me\\a.txt");
+        assert_eq!(super::powershell_quote("C:\\my files\\it's"), "'C:\\my files\\it''s'");
+        // PowerShell reads these specially outside quotes.
+        assert_eq!(super::powershell_quote("a,b$c"), "'a,b$c'");
+    }
+
+    /// `cd_into` clears what's typed, then changes folder, quoted so any
+    /// name works.
+    #[test]
+    fn cd_commands_are_quoted_for_the_shell() {
+        assert_eq!(super::posix_cd("/tmp/it's here"), "\x05\x15 cd -- '/tmp/it'\\''s here'\r");
+        assert_eq!(
+            super::powershell_cd("C:\\it's here"),
+            "\x1b[1;5F\x1b[1;5H Set-Location -LiteralPath 'C:\\it''s here'\r"
+        );
+    }
+
+    #[test]
+    fn pasted_line_breaks_are_returns() {
+        use super::paste_bytes;
+        assert_eq!(paste_bytes("one\r\ntwo\nthree\r", false), b"one\rtwo\rthree\r");
+        assert_eq!(paste_bytes("no breaks", false), b"no breaks");
+    }
+
+    /// A program that turned bracketed paste on gets the text between the
+    /// markers, and text can't end the paste early to run what follows.
+    #[test]
+    fn bracketed_pastes_cant_end_early() {
+        use super::paste_bytes;
+        assert_eq!(paste_bytes("ls\nrm -rf x\n", true), b"\x1b[200~ls\rrm -rf x\r\x1b[201~");
+        assert_eq!(paste_bytes("a\x1b[201~\nrm x\n", true), b"\x1b[200~a\rrm x\r\x1b[201~");
+        assert_eq!(paste_bytes("\x1b[200~a\x1b[201~", true), b"\x1b[200~a\x1b[201~");
+        // Taking one marker out mustn't leave another behind.
+        assert_eq!(paste_bytes("x\x1b[20\x1b[201~1~y", true), b"\x1b[200~xy\x1b[201~");
+    }
+
+    /// When a command is running, `cd_into` sends ^C right away, again every
+    /// half second, ^\ after three seconds, and gives up a second later.
+    #[test]
+    fn interrupting_escalates_then_gives_up() {
+        use super::{Interrupt, InterruptStep};
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut interrupt = Interrupt::new(start);
+        assert_eq!(interrupt.step(at(100), true), InterruptStep::Wait);
+        assert_eq!(interrupt.step(at(500), true), InterruptStep::Send(b"\x03"));
+        assert_eq!(interrupt.step(at(600), true), InterruptStep::Wait);
+        assert_eq!(interrupt.step(at(1000), true), InterruptStep::Send(b"\x03"));
+        assert_eq!(interrupt.step(at(3000), true), InterruptStep::Send(Interrupt::QUIT));
+        assert_eq!(interrupt.step(at(3500), true), InterruptStep::Wait);
+        assert_eq!(interrupt.step(at(4000), true), InterruptStep::Done);
+        // Back at a prompt: type at once.
+        let mut interrupt = Interrupt::new(start);
+        assert_eq!(interrupt.step(at(100), false), InterruptStep::Done);
+    }
+
+    /// Frames go out in order; a kill drops input that hasn't gone yet (the
+    /// rest of a paste) and is still sent when the view lets go.
+    #[test]
+    fn the_outbox_sends_in_order_and_kills_first() {
+        use super::{INPUT_CHUNK, Outbox};
+        let frames = |outbox: &Outbox| -> Vec<(u8, usize)> {
+            outbox.state.lock().unwrap().frames.iter().map(|(kind, bytes)| (*kind, bytes.len())).collect()
+        };
+        let outbox = Outbox::default();
+        outbox.push_input(&vec![b'a'; INPUT_CHUNK * 2 + 1]);
+        outbox.push(frame::RESIZE, vec![1]);
+        assert_eq!(
+            frames(&outbox),
+            [(frame::INPUT, INPUT_CHUNK), (frame::INPUT, INPUT_CHUNK), (frame::INPUT, 1), (frame::RESIZE, 1)]
+        );
+        assert_eq!(outbox.next().map(|(kind, _)| kind), Some(frame::INPUT));
+        outbox.kill();
+        assert_eq!(frames(&outbox), [(frame::RESIZE, 1), (frame::KILL, 0)]);
+        assert!(outbox.close(), "the kill is still to go");
+        assert_eq!(outbox.next().map(|(kind, _)| kind), Some(frame::KILL));
+        assert_eq!(outbox.next(), None);
+
+        // Detaching drops what's left.
+        let outbox = Outbox::default();
+        outbox.push_input(b"ls\r");
+        assert!(!outbox.close());
+        assert_eq!(outbox.next(), None);
+    }
+
+    /// A small screen of text, as the shell would draw it.
+    fn term_with(text: &str, columns: usize, lines: usize) -> Term<alacritty_terminal::event::VoidListener> {
+        let config = term::Config {
+            scrolling_history: 100,
+            ..Default::default()
+        };
+        let mut term = Term::new(config, &GridSize { columns, lines }, alacritty_terminal::event::VoidListener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, text.as_bytes());
+        term
+    }
+
+    /// Where a click or drag lands on a grid of 10×20 px cells at (0, 0):
+    /// `column` with a fraction for where in the cell.
+    fn at(cells: &CellGeometry, column: f32, line: usize) -> (GridPoint, Side) {
+        cells.selection_point(point(px(column * 10.), px(line as f32 * 20. + 5.)), 0)
+    }
+
+    fn cells(columns: usize, lines: usize) -> CellGeometry {
+        CellGeometry {
+            origin: point(px(0.), px(0.)),
+            width: px(10.),
+            height: px(20.),
+            columns,
+            lines,
+        }
+    }
+
+    #[test]
+    fn mouse_selection_copies_the_text_under_it() {
+        let mut term = term_with("hello world\r\nsecond line\r\n$ ", 20, 4);
+        let cells = cells(20, 4);
+
+        // A drag from the left half of "h" to the right half of "o".
+        let (start, side) = at(&cells, 0.2, 0);
+        assert_eq!((start, side), (GridPoint::new(Line(0), Column(0)), Side::Left));
+        let mut selection = Selection::new(selection_type(1), start, side);
+        let (end, side) = at(&cells, 4.7, 0);
+        selection.update(end, side);
+        term.selection = Some(selection);
+        assert_eq!(term.selection_to_string().as_deref(), Some("hello"));
+
+        // Across lines, past the end of the second: the break between them
+        // comes, the one after the last doesn't (alacritty drops it).
+        let (end, side) = at(&cells, 19.9, 1);
+        term.selection.as_mut().unwrap().update(end, side);
+        assert_eq!(term.selection_to_string().as_deref(), Some("hello world\nsecond line"));
+
+        // A click without a drag selects nothing.
+        let (start, side) = at(&cells, 3.2, 1);
+        term.selection = Some(Selection::new(selection_type(1), start, side));
+        assert!(term.selection.as_ref().unwrap().is_empty());
+        assert_eq!(term.selection_to_string(), None);
+
+        // Double click: the word; triple click: the line.
+        let (point, side) = at(&cells, 8.5, 0);
+        term.selection = Some(Selection::new(selection_type(2), point, side));
+        assert_eq!(term.selection_to_string().as_deref(), Some("world"));
+        term.selection = Some(Selection::new(selection_type(3), point, side));
+        assert_eq!(term.selection_to_string().as_deref(), Some("hello world\n"));
+
+        // ⌘A: everything, down to the prompt.
+        term.selection = Some(select_all(&term));
+        assert_eq!(term.selection_to_string().as_deref(), Some("hello world\nsecond line\n$"));
+    }
+
+    /// Output that scrolls the screen moves the selection with its text,
+    /// and ⌘A reaches back into the scrollback.
+    #[test]
+    fn the_selection_stays_on_its_text_as_output_arrives() {
+        let mut term = term_with("first\r\nsecond\r\n", 10, 3);
+        let mut selection = Selection::new(SelectionType::Simple, GridPoint::new(Line(1), Column(0)), Side::Left);
+        selection.update(GridPoint::new(Line(1), Column(5)), Side::Right);
+        term.selection = Some(selection);
+        assert_eq!(term.selection_to_string().as_deref(), Some("second"));
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, b"three\r\nfour\r\nfive\r\n");
+        assert!(term.history_size() > 0, "the text scrolled into the scrollback");
+        assert_eq!(term.selection_to_string().as_deref(), Some("second"));
+
+        term.selection = Some(select_all(&term));
+        assert_eq!(term.selection_to_string().as_deref(), Some("first\nsecond\nthree\nfour\nfive"));
+    }
+
+    /// The highlight covers each selected row's cells: from the start to the
+    /// end of the line, whole lines between, up to the end on the last.
+    #[test]
+    fn the_selection_is_painted_row_by_row() {
+        let range = SelectionRange::new(GridPoint::new(Line(-1), Column(3)), GridPoint::new(Line(1), Column(2)), false);
+        // Scrolled back by one: line -1 is the top row.
+        assert_eq!(selection_rows(&range, 1, 4, 10), [(0, 3, 9), (1, 0, 9), (2, 0, 2)]);
+        // At the bottom, line -1 is off screen.
+        assert_eq!(selection_rows(&range, 0, 4, 10), [(0, 0, 9), (1, 0, 2)]);
+    }
+
+    /// Dragging past the top scrolls back, past the bottom forward; faster
+    /// further out.
+    #[test]
+    fn dragging_past_an_edge_scrolls() {
+        let cells = CellGeometry {
+            origin: point(px(0.), px(100.)),
+            ..cells(20, 4)
+        };
+        assert_eq!(cells.lines_past_edge(point(px(5.), px(150.))), 0);
+        assert_eq!(cells.lines_past_edge(point(px(5.), px(95.))), 1);
+        assert_eq!(cells.lines_past_edge(point(px(5.), px(50.))), 3);
+        assert_eq!(cells.lines_past_edge(point(px(5.), px(180.))), -1);
+        assert_eq!(cells.lines_past_edge(point(px(5.), px(9000.))), -10);
+        // Beyond the right edge counts as the last cell's right half.
+        let (at, side) = cells.selection_point(point(px(500.), px(105.)), 0);
+        assert_eq!((at, side), (GridPoint::new(Line(0), Column(19)), Side::Right));
+    }
+
+    /// End to end with a real shell: interrupt what's running the way
+    /// `cd_into` does (a command that ignores ^C, on Unix, so it takes the
+    /// ^\), then go to a folder whose name needs quoting.
+    #[test]
+    fn cd_into_interrupts_a_running_command() {
+        let folder = std::env::temp_dir().join(format!("xharness cd 'here' {}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let host = crate::services::server::tests::start_test_host("cd-into");
+        let (session, _events) = Session::attach("cd-into-test", None, &host).expect("shell starts");
+        assert!(wait_for_state(&session, ShellState::Prompt), "never reached a prompt");
+        session.write(shell_command("trap '' INT; sleep 30\r", "sleep 30\r").to_vec());
+        assert!(wait_for_state(&session, ShellState::Running), "didn't see the command start");
+
+        session.write(Interrupt::INTERRUPT);
+        let mut interrupt = Interrupt::new(Instant::now());
+        loop {
+            std::thread::sleep(Interrupt::POLL);
+            match interrupt.step(Instant::now(), session.shell_state() == ShellState::Running) {
+                InterruptStep::Send(bytes) => session.write(bytes),
+                InterruptStep::Wait => {}
+                InterruptStep::Done => break,
+            }
+        }
+        assert_eq!(session.shell_state(), ShellState::Prompt, "still running");
+        session.write(cd_command(&folder).into_bytes());
+        session.write(shell_command("echo \"in:$(basename \"$PWD\")\"\r", "echo \"in:$(Split-Path -Leaf $PWD)\"\r").to_vec());
+        let expected = format!("in:{}", folder.file_name().unwrap().to_string_lossy());
+        assert!(
+            wait_for(&session, &expected),
+            "not in the folder; screen was:\n{}",
+            screen(&session.term.lock())
+        );
+        std::fs::remove_dir_all(&folder).ok();
     }
     use gpui::Modifiers;
 

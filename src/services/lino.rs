@@ -459,12 +459,6 @@ pub fn format_span(secs: u64) -> String {
     }
 }
 
-/// `at` (RFC 3339) relative to `now` (Unix seconds): `just now`, `5m ago`.
-pub fn ago(at: &str, now: i64) -> Option<String> {
-    let secs = (now - parse_time(at)?).max(0) as u64;
-    Some(if secs < 5 { "just now".to_string() } else { format!("{} ago", format_span(secs).split(' ').next()?) })
-}
-
 /// Unix seconds of an RFC 3339 time, e.g. `2026-11-01T21:08:34.38118+03:00`.
 pub fn parse_time(text: &str) -> Option<i64> {
     let (date, rest) = text.split_once(['T', 't', ' '])?;
@@ -508,8 +502,6 @@ mod tests {
         assert_eq!(parse_time("2026-11-01T21:08:34.38118+03:00"), Some(1_793_556_514));
         assert_eq!(parse_time("2000-02-29T23:59:59-05:30"), Some(951_888_599));
         assert_eq!(parse_time("yesterday"), None);
-        assert_eq!(ago("2026-11-01T21:08:34+03:00", 1_793_556_514 + 300).as_deref(), Some("5m ago"));
-        assert_eq!(ago("2026-11-01T21:08:34+03:00", 1_793_556_514 + 2).as_deref(), Some("just now"));
     }
 
     #[test]

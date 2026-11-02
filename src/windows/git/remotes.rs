@@ -8,12 +8,13 @@
 use std::{path::Path, rc::Rc, time::Duration};
 
 use gpui::{
-    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, Focusable, FontWeight, Pixels, Point, Task, Window, div, prelude::*,
+    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, Focusable, FontWeight, Task, Window, div, prelude::*,
     rems,
 };
 
 use super::{GitEvent, GitView, checkbox, field};
 use crate::services::git::{self, Remote};
+use crate::i18n::{t, tf, tn};
 use crate::services::github::{self, Accounts, DeviceCode, SignIn, SignedIn};
 use crate::ui::assets::IconName;
 use crate::ui::context_menu::MenuEntry;
@@ -98,6 +99,21 @@ fn repository_name(folder: &Path) -> String {
         .map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '-' })
         .collect();
     name.trim_matches('-').to_string()
+}
+
+/// Where git keeps the GitHub token (as [`Accounts::stored_in`] says it), in
+/// the app's language.
+fn stored_in_label(stored_in: &str) -> String {
+    match stored_in {
+        "the macOS keychain" => t("the macOS keychain").to_string(),
+        "the GitHub CLI" => t("the GitHub CLI").to_string(),
+        "the system keyring" => t("the system keyring").to_string(),
+        "git's memory cache (for a while)" => t("git's memory cache (for a while)").to_string(),
+        other => match other.strip_prefix("git's “").and_then(|rest| rest.strip_suffix("” helper")) {
+            Some(helper) => tf("git's “{}” helper", &[&helper]),
+            None => other.to_string(),
+        },
+    }
 }
 
 impl GitView {
@@ -285,8 +301,8 @@ impl GitView {
             return;
         };
         match form {
-            RemoteForm::Add => self.remote_act("Adding…", move |root| git::add_remote(root, &name, &url), cx),
-            RemoteForm::Edit(old) => self.remote_act("Saving…", move |root| git::edit_remote(root, &old, &name, &url), cx),
+            RemoteForm::Add => self.remote_act(t("Adding…"), move |root| git::add_remote(root, &name, &url), cx),
+            RemoteForm::Edit(old) => self.remote_act(t("Saving…"), move |root| git::edit_remote(root, &old, &name, &url), cx),
             _ => {}
         }
     }
@@ -308,7 +324,7 @@ impl GitView {
             }
         });
         let panel = self.remotes_panel.as_mut().unwrap();
-        panel.busy = Some("Testing…");
+        panel.busy = Some(t("Testing…"));
         panel.test = None;
         panel.action_task = Some(task);
         cx.notify();
@@ -319,14 +335,16 @@ impl GitView {
         let target = name.clone();
         let action: Rc<dyn Fn(&mut App)> = Rc::new(move |cx: &mut App| {
             let target = target.clone();
-            weak.update(cx, |this, cx| this.remote_act("Removing…", move |root| git::remove_remote(root, &target), cx))
+            weak.update(cx, |this, cx| this.remote_act(t("Removing…"), move |root| git::remove_remote(root, &target), cx))
                 .ok();
         });
         cx.emit(GitEvent::Confirm {
-            title: format!("Remove the remote “{name}”?"),
-            description: "Only this repository's link to it goes; nothing on the server is deleted. Branches that tracked it stop tracking."
-                .to_string(),
-            confirm: "Remove remote".to_string(),
+            title: tf("Remove the remote “{}”?", &[&name]),
+            description: t(
+                "Only this repository's link to it goes; nothing on the server is deleted. Branches that tracked it stop tracking.",
+            )
+            .to_string(),
+            confirm: t("Remove remote").to_string(),
             action,
         });
     }
@@ -346,13 +364,13 @@ impl GitView {
         let remote = if self.remotes.iter().any(|r| r == "origin") { "github" } else { "origin" };
         let publish = self.status.head.is_some();
         self.remote_act(
-            "Creating…",
+            t("Creating…"),
             move |root| {
                 let repository = github::create_repository(owner.as_deref(), &name, &description, private)?;
                 git::add_remote(root, remote, &repository.clone_url)?;
                 if publish {
                     git::publish_to(root, remote)
-                        .map_err(|error| format!("The repository was made, but publishing to it failed: {error}"))?;
+                        .map_err(|error| tf("The repository was made, but publishing to it failed: {}", &[&error]))?;
                 }
                 Ok(())
             },
@@ -360,7 +378,7 @@ impl GitView {
         );
     }
 
-    fn owner_menu(&self, position: Point<Pixels>, cx: &mut Context<Self>) {
+    fn owner_menu(&self, position: crate::ui::context_menu::MenuAt, cx: &mut Context<Self>) {
         let Some(panel) = self.remotes_panel.as_ref() else {
             return;
         };
@@ -530,11 +548,11 @@ impl GitView {
             return;
         }
         window.focus(&self.focus_handle);
-        self.github_act("Signing in…", move || github::sign_in_with_token(&token), cx);
+        self.github_act(t("Signing in…"), move || github::sign_in_with_token(&token), cx);
     }
 
     fn sign_in_with_cli(&mut self, login: String, cx: &mut Context<Self>) {
-        self.github_act("Signing in…", move || github::sign_in_with_cli(&login), cx);
+        self.github_act(t("Signing in…"), move || github::sign_in_with_cli(&login), cx);
     }
 
     fn sign_out(&mut self, login: String, stored_in: String, cx: &mut Context<Self>) {
@@ -557,18 +575,19 @@ impl GitView {
                     this.load_github(cx);
                 });
                 let panel = this.remotes_panel.as_mut().unwrap();
-                panel.busy = Some("Signing out…");
+                panel.busy = Some(t("Signing out…"));
                 panel.action_task = Some(task);
                 cx.notify();
             })
             .ok();
         });
         cx.emit(GitEvent::Confirm {
-            title: format!("Sign out of GitHub as {login}?"),
-            description: format!(
-                "The token is removed from {stored_in}, so git can't push or pull private repositories on github.com over HTTPS until you sign in again."
+            title: tf("Sign out of GitHub as {}?", &[&login]),
+            description: tf(
+                "The token is removed from {}, so git can't push or pull private repositories on github.com over HTTPS until you sign in again.",
+                &[&stored_in_label(&stored_in)],
             ),
-            confirm: "Sign out".to_string(),
+            confirm: t("Sign out").to_string(),
             action,
         });
     }
@@ -583,7 +602,7 @@ impl GitView {
             .flex()
             .items_center()
             .gap_2()
-            .child(div().flex_1().text_size(rems(0.9375)).font_weight(FontWeight::SEMIBOLD).child("Remotes & GitHub"))
+            .child(div().flex_1().text_size(rems(0.9375)).font_weight(FontWeight::SEMIBOLD).child(t("Remotes & GitHub")))
             .children(panel.busy.map(|busy| div().text_size(rems(0.75)).text_color(theme.muted_foreground).child(busy)))
             .child(ui::small_icon_button("git-remotes-close", IconName::X, theme).on_click(cx.listener(
                 |this, _, window, cx| this.close_remotes(window, cx),
@@ -623,12 +642,12 @@ impl GitView {
     fn render_remote_list(&self, panel: &RemotesPanel, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
         let mut card = card(theme);
         match &panel.remotes {
-            None => card = card.child(note("Reading the remotes…", theme).px_3().py_3()),
+            None => card = card.child(note(t("Reading the remotes…"), theme).px_3().py_3()),
             Some(Err(error)) => card = card.child(note(error, theme).px_3().py_3()),
             Some(Ok(remotes)) if remotes.is_empty() && panel.form == RemoteForm::None => {
                 card = card.child(
                     note(
-                        "No remote yet. Add one to push your commits somewhere and pull others', or make a repository on GitHub.",
+                        t("No remote yet. Add one to push your commits somewhere and pull others', or make a repository on GitHub."),
                         theme,
                     )
                     .px_3()
@@ -653,18 +672,18 @@ impl GitView {
         }
         let signed_in = panel.account().is_some();
         let idle = panel.form == RemoteForm::None;
-        section("Remotes", theme).child(card).when(idle, |section| {
+        section(t("Remotes"), theme).child(card).when(idle, |section| {
             section.child(
                 div()
                     .flex()
                     .flex_wrap()
                     .items_center()
                     .gap_2()
-                    .child(ui::compact_button("git-remote-add", Some(IconName::Plus), "Add remote", false, theme).on_click(
+                    .child(ui::compact_button("git-remote-add", Some(IconName::Plus), t("Add remote"), false, theme).on_click(
                         cx.listener(|this, _, window, cx| this.set_form(RemoteForm::Add, window, cx)),
                     ))
                     .child(
-                        ui::compact_button("git-remote-create", Some(IconName::Github), "New repository on GitHub", false, theme)
+                        ui::compact_button("git-remote-create", Some(IconName::Github), t("New repository on GitHub"), false, theme)
                             .when(!signed_in, |b| b.opacity(0.5))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 if signed_in {
@@ -674,7 +693,7 @@ impl GitView {
                     )
                     .when(!signed_in, |row| {
                         row.child(div().text_size(rems(0.6875)).text_color(theme.muted_foreground).child(
-                            "Sign in to GitHub below to make one.",
+                            t("Sign in to GitHub below to make one."),
                         ))
                     }),
             )
@@ -683,7 +702,7 @@ impl GitView {
 
     fn render_remote(&self, ix: usize, remote: &Remote, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
         let web = github::web_url(&remote.url);
-        let ssh_note = (web.is_some() && github::is_ssh(&remote.url)).then_some("Over SSH: git uses your SSH key, not the GitHub sign-in.");
+        let ssh_note = (web.is_some() && github::is_ssh(&remote.url)).then(|| t("Over SSH: git uses your SSH key, not the GitHub sign-in."));
         let (edit, remove) = (remote.name.clone(), remote.name.clone());
         div()
             .flex()
@@ -707,7 +726,7 @@ impl GitView {
                     .gap_0p5()
                     .child(div().text_size(rems(0.8125)).font_weight(FontWeight::SEMIBOLD).child(remote.name.clone()))
                     .child(mono(&remote.url, theme))
-                    .children(remote.push_url.as_ref().map(|push| mono(&format!("pushes to {push}"), theme)))
+                    .children(remote.push_url.as_ref().map(|push| mono(&tf("pushes to {}", &[push]), theme)))
                     .children(ssh_note.map(|text| note(text, theme))),
             )
             .children(web.map(|url| {
@@ -727,17 +746,16 @@ impl GitView {
         let url = self.remote_url.read(cx).text().trim().to_string();
         let ready = !url.is_empty() && !self.remote_name.read(cx).text().trim().is_empty() && panel.busy.is_none();
         let test = panel.test.as_ref().filter(|(tested, _)| *tested == url).map(|(_, result)| match result {
-            Ok(0) => ("Reachable, and empty: publish a branch to it.".to_string(), true),
-            Ok(1) => ("Reachable: 1 branch.".to_string(), true),
-            Ok(n) => (format!("Reachable: {n} branches."), true),
+            Ok(0) => (t("Reachable, and empty: publish a branch to it.").to_string(), true),
+            Ok(n) => (tn(*n, "Reachable: {} branch.", "Reachable: {} branches."), true),
             Err(error) => (error.clone(), false),
         });
         let hint = if url.starts_with("https://github.com/") {
-            "HTTPS: git uses the GitHub sign-in below."
+            t("HTTPS: git uses the GitHub sign-in below.")
         } else if github::is_ssh(&url) {
-            "SSH: git uses your SSH key."
+            t("SSH: git uses your SSH key.")
         } else {
-            "An HTTPS or SSH URL (git@host:owner/repo.git), or a path on the server."
+            t("An HTTPS or SSH URL (git@host:owner/repo.git), or a path on the server.")
         };
         div()
             .flex()
@@ -747,7 +765,7 @@ impl GitView {
             .border_t_1()
             .border_color(theme.border)
             .bg(theme.secondary.opacity(0.4))
-            .child(labeled("Name", field(theme).child(div().flex_1().min_w_0().child(self.remote_name.clone())), theme))
+            .child(labeled(t("Name"), field(theme).child(div().flex_1().min_w_0().child(self.remote_name.clone())), theme))
             .child(labeled("URL", field(theme).child(div().flex_1().min_w_0().child(self.remote_url.clone())), theme))
             .child(match test {
                 Some((text, ok)) => div()
@@ -761,7 +779,7 @@ impl GitView {
                     .flex()
                     .gap_2()
                     .child(
-                        ui::compact_button("git-remote-save", None, if adding { "Add remote" } else { "Save" }, true, theme)
+                        ui::compact_button("git-remote-save", None, if adding { t("Add remote") } else { t("Save") }, true, theme)
                             .when(!ready, |b| b.opacity(0.5))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if ready {
@@ -770,11 +788,11 @@ impl GitView {
                             })),
                     )
                     .child(
-                        ui::compact_button("git-remote-test", None, "Test connection", false, theme)
+                        ui::compact_button("git-remote-test", None, t("Test connection"), false, theme)
                             .when(url.is_empty(), |b| b.opacity(0.5))
                             .on_click(cx.listener(|this, _, _, cx| this.test_remote(cx))),
                     )
-                    .child(ui::compact_button("git-remote-cancel", None, "Cancel", false, theme).on_click(cx.listener(
+                    .child(ui::compact_button("git-remote-cancel", None, t("Cancel"), false, theme).on_click(cx.listener(
                         |this, _, window, cx| this.set_form(RemoteForm::None, window, cx),
                     ))),
             )
@@ -786,11 +804,11 @@ impl GitView {
         let name = self.repo_name.read(cx).text().trim().to_string();
         let ready = !name.is_empty() && panel.busy.is_none();
         let remote = if self.remotes.iter().any(|r| r == "origin") { "github" } else { "origin" };
-        let branch = self.status.branch.clone().unwrap_or_else(|| "this branch".to_string());
+        let branch = self.status.branch.clone().unwrap_or_else(|| t("this branch").to_string());
         let what = if self.status.head.is_some() {
-            format!("Makes github.com/{owner}/{name}, adds it as “{remote}”, and publishes {branch} to it.")
+            tf("Makes github.com/{}/{}, adds it as “{}”, and publishes {} to it.", &[&owner, &name, &remote, &branch])
         } else {
-            format!("Makes github.com/{owner}/{name} and adds it as “{remote}”. Commit something, then publish.")
+            tf("Makes github.com/{}/{} and adds it as “{}”. Commit something, then publish.", &[&owner, &name, &remote])
         };
         let private = panel.private;
         div()
@@ -806,21 +824,24 @@ impl GitView {
                     .flex()
                     .gap_2()
                     .child(labeled(
-                        "Owner",
+                        t("Owner"),
                         field(theme)
                             .id("git-repo-owner")
                             .cursor_pointer()
                             .child(ui::icon(IconName::Github).size_3p5().text_color(theme.muted_foreground))
                             .child(div().flex_1().min_w_0().truncate().child(owner))
                             .child(ui::chevron(false, theme).size_3())
-                            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| this.owner_menu(event.position(), cx))),
+                            .child(self.anchors.track("owner"))
+                            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                                this.owner_menu(this.anchors.below("owner", ui::Align::Start, event.position()), cx)
+                            })),
                         theme,
                     )
                     .w(rems(11.)))
-                    .child(labeled("Name", field(theme).child(div().flex_1().min_w_0().child(self.repo_name.clone())), theme).flex_1()),
+                    .child(labeled(t("Name"), field(theme).child(div().flex_1().min_w_0().child(self.repo_name.clone())), theme).flex_1()),
             )
             .child(labeled(
-                "Description",
+                t("Description"),
                 field(theme).child(div().flex_1().min_w_0().child(self.repo_description.clone())),
                 theme,
             ))
@@ -833,7 +854,7 @@ impl GitView {
                     .cursor_pointer()
                     .text_size(rems(0.75))
                     .child(checkbox(private, false, theme))
-                    .child("Private: only you and people you add can see it")
+                    .child(t("Private: only you and people you add can see it"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let Some(panel) = this.remotes_panel.as_mut() {
                             panel.private = !panel.private;
@@ -847,7 +868,7 @@ impl GitView {
                     .flex()
                     .gap_2()
                     .child(
-                        ui::compact_button("git-repo-create", Some(IconName::Github), "Create repository", true, theme)
+                        ui::compact_button("git-repo-create", Some(IconName::Github), t("Create repository"), true, theme)
                             .when(!ready, |b| b.opacity(0.5))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if ready {
@@ -855,7 +876,7 @@ impl GitView {
                                 }
                             })),
                     )
-                    .child(ui::compact_button("git-repo-cancel", None, "Cancel", false, theme).on_click(cx.listener(
+                    .child(ui::compact_button("git-repo-cancel", None, t("Cancel"), false, theme).on_click(cx.listener(
                         |this, _, window, cx| this.set_form(RemoteForm::None, window, cx),
                     ))),
             )
@@ -864,7 +885,7 @@ impl GitView {
     fn render_github(&self, panel: &RemotesPanel, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
         let body = card(theme).p_3().gap_3();
         let body = match &panel.github {
-            None => body.child(note("Checking GitHub…", theme)),
+            None => body.child(note(t("Checking GitHub…"), theme)),
             Some(Err(error)) => body.child(note(error, theme)),
             Some(Ok(accounts)) => {
                 let account_row = |icon_text: String, detail: String, login: String| {
@@ -884,7 +905,7 @@ impl GitView {
                                 .child(div().text_size(rems(0.8125)).font_weight(FontWeight::SEMIBOLD).child(icon_text))
                                 .child(note(&detail, theme)),
                         )
-                        .child(ui::compact_button("git-github-sign-out", Some(IconName::LogOut), "Sign out", false, theme).on_click(
+                        .child(ui::compact_button("git-github-sign-out", Some(IconName::LogOut), t("Sign out"), false, theme).on_click(
                             cx.listener(move |this, _, _, cx| this.sign_out(login.clone(), stored_in.clone(), cx)),
                         ))
                 };
@@ -894,18 +915,18 @@ impl GitView {
                             Some(name) => format!("{name} · @{}", account.login),
                             None => format!("@{}", account.login),
                         };
-                        let detail = format!(
+                        let detail = tf(
                             "Git pushes and pulls github.com over HTTPS as @{}, here and in your terminals. The token is in {}.",
-                            account.login, accounts.stored_in
+                            &[&account.login, &stored_in_label(&accounts.stored_in)],
                         );
                         let others: Vec<String> = accounts.cli.iter().filter(|login| **login != account.login).cloned().collect();
                         body.child(account_row(title, detail, account.login.clone())).when(!others.is_empty(), |body| {
-                            body.child(self.render_cli_accounts("Switch to an account the GitHub CLI has:", &others, theme, cx))
+                            body.child(self.render_cli_accounts(t("Switch to an account the GitHub CLI has:"), &others, theme, cx))
                         })
                     }
                     SignedIn::Unchecked { login, error } => body.child(account_row(
                         format!("@{login}"),
-                        format!("Git has a token for @{login}, but GitHub couldn't be asked about it: {error}"),
+                        tf("Git has a token for @{}, but GitHub couldn't be asked about it: {}", &[login, error]),
                         login.clone(),
                     )),
                     SignedIn::Rejected(login) => body
@@ -913,19 +934,19 @@ impl GitView {
                             div()
                                 .text_size(rems(0.75))
                                 .text_color(theme.tints.amber.soft_foreground)
-                                .child(format!("GitHub turns down the token git has for @{login} (revoked or expired). Sign in again.")),
+                                .child(tf("GitHub turns down the token git has for @{} (revoked or expired). Sign in again.", &[login])),
                         )
                         .child(self.render_sign_in(panel, accounts, theme, cx)),
                     SignedIn::No => body
                         .child(note(
-                            "Sign in so git can push and pull github.com over HTTPS: private repositories, and pushing to your own.",
+                            t("Sign in so git can push and pull github.com over HTTPS: private repositories, and pushing to your own."),
                             theme,
                         ))
                         .child(self.render_sign_in(panel, accounts, theme, cx)),
                 }
             }
         };
-        section("GitHub", theme).child(body)
+        section(t("GitHub"), theme).child(body)
     }
 
     fn render_cli_accounts(&self, label: &str, logins: &[String], theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
@@ -946,7 +967,7 @@ impl GitView {
 
     fn render_sign_in(&self, panel: &RemotesPanel, accounts: &Accounts, theme: &Theme, cx: &Context<Self>) -> AnyElement {
         match &panel.sign_in {
-            SignInStep::Starting => note("Asking GitHub for a code…", theme).into_any_element(),
+            SignInStep::Starting => note(t("Asking GitHub for a code…"), theme).into_any_element(),
             SignInStep::Code(code) => {
                 let (copy, open) = (code.code.clone(), code.url.clone());
                 div()
@@ -954,7 +975,7 @@ impl GitView {
                     .flex_col()
                     .gap_2()
                     .child(note(
-                        &format!("Enter this code at {} (it's open in your browser, and copied):", code.url),
+                        &tf("Enter this code at {} (it's open in your browser, and copied):", &[&code.url]),
                         theme,
                     ))
                     .child(
@@ -968,18 +989,18 @@ impl GitView {
                         div()
                             .flex()
                             .gap_2()
-                            .child(ui::compact_button("git-github-copy", Some(IconName::Copy), "Copy code", false, theme).on_click(
+                            .child(ui::compact_button("git-github-copy", Some(IconName::Copy), t("Copy code"), false, theme).on_click(
                                 cx.listener(move |_, _, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))),
                             ))
                             .child(
-                                ui::compact_button("git-github-open", Some(IconName::ExternalLink), "Open GitHub", false, theme)
+                                ui::compact_button("git-github-open", Some(IconName::ExternalLink), t("Open GitHub"), false, theme)
                                     .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&open))),
                             )
-                            .child(ui::compact_button("git-github-cancel", None, "Cancel", false, theme).on_click(cx.listener(
+                            .child(ui::compact_button("git-github-cancel", None, t("Cancel"), false, theme).on_click(cx.listener(
                                 |this, _, window, cx| this.cancel_sign_in(window, cx),
                             ))),
                     )
-                    .child(note("Waiting for GitHub…", theme))
+                    .child(note(t("Waiting for GitHub…"), theme))
                     .into_any_element()
             }
             SignInStep::Token => {
@@ -989,19 +1010,19 @@ impl GitView {
                     .flex_col()
                     .gap_2()
                     .child(labeled(
-                        "Personal access token",
+                        t("Personal access token"),
                         field(theme)
                             .child(ui::icon(IconName::KeyRound).size_3p5().text_color(theme.muted_foreground))
                             .child(div().flex_1().min_w_0().child(self.token_input.clone())),
                         theme,
                     ))
-                    .child(note("A classic token with the repo scope (and workflow, to push workflow files) works for every repository you can reach.", theme))
+                    .child(note(t("A classic token with the repo scope (and workflow, to push workflow files) works for every repository you can reach."), theme))
                     .child(
                         div()
                             .flex()
                             .gap_2()
                             .child(
-                                ui::compact_button("git-github-token-sign-in", None, "Sign in", true, theme)
+                                ui::compact_button("git-github-token-sign-in", None, t("Sign in"), true, theme)
                                     .when(!ready, |b| b.opacity(0.5))
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         if ready {
@@ -1010,10 +1031,10 @@ impl GitView {
                                     })),
                             )
                             .child(
-                                ui::compact_button("git-github-token-new", Some(IconName::ExternalLink), "Make a token on GitHub", false, theme)
+                                ui::compact_button("git-github-token-new", Some(IconName::ExternalLink), t("Make a token on GitHub"), false, theme)
                                     .on_click(cx.listener(|_, _, _, cx| cx.open_url(github::NEW_TOKEN_URL))),
                             )
-                            .child(ui::compact_button("git-github-token-cancel", None, "Cancel", false, theme).on_click(cx.listener(
+                            .child(ui::compact_button("git-github-token-cancel", None, t("Cancel"), false, theme).on_click(cx.listener(
                                 |this, _, window, cx| this.cancel_sign_in(window, cx),
                             ))),
                     )
@@ -1032,7 +1053,7 @@ impl GitView {
                             .gap_2()
                             .when(accounts.browser, |row| {
                                 row.child(
-                                    ui::compact_button("git-github-sign-in", Some(IconName::Github), "Sign in with GitHub", true, theme)
+                                    ui::compact_button("git-github-sign-in", Some(IconName::Github), t("Sign in with GitHub"), true, theme)
                                         .when(busy, |b| b.opacity(0.5))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             if !busy {
@@ -1042,7 +1063,7 @@ impl GitView {
                                 )
                             })
                             .child(
-                                ui::compact_button("git-github-use-token", Some(IconName::KeyRound), "Use a token", !accounts.browser, theme)
+                                ui::compact_button("git-github-use-token", Some(IconName::KeyRound), t("Use a token"), !accounts.browser, theme)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         if let Some(panel) = this.remotes_panel.as_mut() {
                                             panel.sign_in = SignInStep::Token;
@@ -1054,7 +1075,7 @@ impl GitView {
                             ),
                     )
                     .when(!accounts.cli.is_empty(), |el| {
-                        el.child(self.render_cli_accounts("Or use an account the GitHub CLI has:", &accounts.cli, theme, cx))
+                        el.child(self.render_cli_accounts(t("Or use an account the GitHub CLI has:"), &accounts.cli, theme, cx))
                     })
                     .into_any_element()
             }

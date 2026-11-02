@@ -4,8 +4,8 @@
 
 A native canvas for each project: terminals that outlive the app, editors with
 syntax highlighting and language servers, Finder-style explorers, a GitHub
-Desktop-style git client, and [lino](https://github.com/astralyxdev/lino) for
-agents. Built with [GPUI](https://www.gpui.rs) and the Astralyx UI design tokens.
+Desktop-style git client, browsers that show pages at a phone's or a
+desktop's size, and [lino](https://github.com/astralyxdev/lino) for agents. Built with [GPUI](https://www.gpui.rs) and the Astralyx UI design tokens.
 
 ## Client and server
 
@@ -18,7 +18,9 @@ you're back where they are. Language servers stay in the app.
 This Mac's server listens on a Unix socket in the data folder. It starts when
 you click **Start** (in the footer, or on a project that needs it) and runs
 until you **Stop** it; stopping ends its terminals, so it asks first. While it
-runs, its X sits in the menu bar, with Open XHarness and Stop server.
+runs, its X sits in the menu bar, with Open XHarness and Stop server. There's
+one app at a time: starting it again (Open XHarness, the Dock, a terminal)
+brings its window to the front.
 
 The footer shows the selected project's server: running or not, its address,
 ping, OS, terminals and uptime.
@@ -63,6 +65,7 @@ src/
     project_dialog.rs  new project / edit project / edit window (local or remote)
     servers.rs         which servers answer: pinged every few seconds
     footer.rs          the selected project's server, Start / Stop
+    instance.rs        one app at a time (a second start shows the first)
   canvas/            a project's infinite canvas (pan, zoom, move, resize)
     geometry.rs        resize, zoom-around and fit arithmetic
     scaled.rs          renders a window's contents at the zoomed rem size
@@ -79,6 +82,9 @@ src/
     git.rs             changes, commits, branches, history graph
     git/remotes.rs     remotes, a new GitHub repository, GitHub sign-in
     lino.rs            lino's live stats
+    browser/           web pages (mod.rs), device sizes (devices.rs),
+                       the address bar (address.rs), keeping native pages
+                       behind what's in front of them (layers.rs)
   services/          no UI
     projects.rs        projects, windows and layouts, saved per folder
     server.rs          the server: its socket (and port), terminals, and calls
@@ -99,8 +105,10 @@ src/
     mod.rs             buttons, sidebar pieces, dialogs
     text_input.rs, context_menu.rs, alert_dialog.rs, actions.rs
   platform/macos.rs  trackpad pinch, the Dock icon, the server's menu bar item
+  platform/webview.rs  WebKit pages for Browser windows (macOS)
 build.rs             clones lino at its pinned version, builds it for the target
-third_party/gpui     gpui 0.2.2, patched to build for Windows anywhere
+third_party/gpui     gpui 0.2.2, patched (see its XHARNESS.md): Windows builds
+                     anywhere, native views keep their own cursor
 scripts/build/       release builds per platform
 .github/             CI, releases, issue and pull request templates
 ```
@@ -152,6 +160,32 @@ its shaders compiled at startup (see `third_party/gpui/XHARNESS.md`). On Windows
 terminals run on ConPTY with PowerShell, and the server uses Unix sockets
 (Windows 10 and later have them).
 
+## Browser windows
+
+**New window → Browser** opens a web page on the canvas (WebKit, on macOS):
+back, forward, reload, and an address bar that takes URLs, `localhost:5173`,
+a bare port (`3000`), a path to an HTML file, or words to search for.
+
+- The bar below it sizes the page: **Responsive** follows the window (the
+  readout shows its size in CSS px), or a device: iPhone SE to 16 Pro Max,
+  Pixel 9, Galaxy S24, iPad mini / Air / Pro, laptop, desktop, Full HD. A
+  device's page is laid out at its exact width and height, centred, and
+  scaled down (the readout says how much) when the window is smaller.
+  Phones and tablets turn on their side, and tell sites they're mobile
+  browsers, so you get the mobile site.
+- Pages zoom with the canvas and still lay out at the same width.
+- ⌘L the address bar, ⌘R reload, ⌘[ / ⌘] back and forward. Right-click,
+  Inspect Element, for Web Inspector (Safari's Develop menu sees them too).
+- The page is a native view over the canvas, so while a window, menu or
+  dialog is in front of it, it shows a snapshot of itself instead.
+- The page and size are saved in `project.json`, so a dev server's address
+  travels with the project. On Windows and Linux the window opens the page
+  in your browser instead, for now.
+
+Terminals pass the mouse wheel to programs that ask for the mouse (Claude
+Code, vim with `mouse=a`, htop), so they scroll their own history; ⇧-scroll
+scrolls the terminal instead.
+
 ## Git remotes and GitHub
 
 In the Git window, the remote button (or **Add remote** when there's none)
@@ -174,11 +208,10 @@ included. Three ways:
 
 ## CI and releases
 
-Every push to `main` and every pull request runs `.github/workflows/ci.yml`:
-the macOS app (build and tests), the server on Linux (tests and the static
-x64/arm64 builds), the Windows app (cross-built) and the Linux app (build
-and tests). A native Windows build with its tests runs too, as an experiment
-that doesn't block yet.
+Every push to `main` and every pull request runs `.github/workflows/ci.yml`,
+which only builds: the macOS app, the static Linux servers (x64 and arm64),
+the Windows app (cross-built and native) and the Linux app. Tests run locally
+(`cargo test`, and `cargo test --no-default-features` for the server).
 
 Pushing a tag `v<version>` (matching `Cargo.toml`) runs
 `.github/workflows/release.yml`, which builds every package and drafts a GitHub

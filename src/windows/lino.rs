@@ -12,6 +12,7 @@ use gpui::{
     Task, Window, div, prelude::*, rems,
 };
 
+use crate::i18n::{t, tf, tn};
 use crate::ui::assets::IconName;
 use crate::windows::explorer::format_size;
 use crate::services::lino::{self, Change, CommandStats, Snapshot, Stats, Status};
@@ -27,6 +28,36 @@ const OWN_COMMANDS: [&str; 2] = ["status", "stats"];
 /// Outcomes of calls that did what was asked (lino's `internal/outcome`);
 /// the rest (conflict, not_found, refused…) are counted as not ok.
 const SUCCESSES: [&str; 5] = ["ok", "updated", "created", "empty", "truncated"];
+
+/// How long something has been going, as [`lino::format_span`] says it
+/// but in the app's language: `45s`, `12m`, `2h 5m`, `3d 4h`.
+pub(crate) fn format_span(secs: u64) -> String {
+    let (m, h, d) = (secs / 60, secs / 3600, secs / 86400);
+    match secs {
+        0..60 => tf("{}s", &[&secs]),
+        60..3600 => tf("{}m", &[&m]),
+        3600..86400 => tf("{}h {}m", &[&h, &(m % 60)]),
+        _ => tf("{}d {}h", &[&d, &(h % 24)]),
+    }
+}
+
+/// How long ago, by its largest unit: `just now`, `5m ago`, `3d ago`.
+pub(crate) fn format_ago(secs: u64) -> String {
+    let (m, h, d) = (secs / 60, secs / 3600, secs / 86400);
+    let span = match secs {
+        0..5 => return t("just now").to_string(),
+        5..60 => tf("{}s", &[&secs]),
+        60..3600 => tf("{}m", &[&m]),
+        3600..86400 => tf("{}h", &[&h]),
+        _ => tf("{}d", &[&d]),
+    };
+    tf("{} ago", &[&span])
+}
+
+/// [`format_ago`] for an RFC 3339 time, as lino writes them.
+fn ago(at: &str, now: i64) -> Option<String> {
+    Some(format_ago((now - lino::parse_time(at)?).max(0) as u64))
+}
 
 /// What a poll found.
 struct Polled {
@@ -123,12 +154,12 @@ impl LinoView {
     pub fn summary(&self) -> Option<String> {
         match &self.state {
             State::Ready(Snapshot::Running { status, .. }) => {
-                Some(format!("up {} · {}", lino::format_span(status.uptime_s), status.id))
+                Some(tf("up {} · {}", &[&format_span(status.uptime_s), &status.id]))
             }
-            State::Ready(Snapshot::Stopped) => Some("stopped".to_string()),
-            State::Ready(Snapshot::NotEnabled) => Some("not set up".to_string()),
-            State::Ready(Snapshot::Failed(_)) => Some("error".to_string()),
-            State::Unavailable => Some("not installed".to_string()),
+            State::Ready(Snapshot::Stopped) => Some(t("stopped").to_string()),
+            State::Ready(Snapshot::NotEnabled) => Some(t("not set up").to_string()),
+            State::Ready(Snapshot::Failed(_)) => Some(t("error").to_string()),
+            State::Unavailable => Some(t("not installed").to_string()),
             State::Checking => None,
         }
     }
@@ -181,21 +212,16 @@ impl LinoView {
 
     fn render_toolbar(&self, theme: &Theme, cx: &Context<Self>) -> impl IntoElement {
         let (dot, label, detail) = match &self.state {
-            State::Checking => (theme.muted_foreground, "Checking…", None),
-            State::Unavailable => (theme.tints.destructive.base, "Not installed", None),
+            State::Checking => (theme.muted_foreground, t("Checking…"), None),
+            State::Unavailable => (theme.tints.destructive.base, t("Not installed"), None),
             State::Ready(Snapshot::Running { status, .. }) => (
                 theme.tints.green.base,
-                "Running",
-                Some(format!(
-                    "{} · pid {} · up {}",
-                    status.id,
-                    status.pid,
-                    lino::format_span(status.uptime_s)
-                )),
+                t("Running"),
+                Some(tf("{} · pid {} · up {}", &[&status.id, &status.pid, &format_span(status.uptime_s)])),
             ),
-            State::Ready(Snapshot::Stopped) => (theme.muted_foreground, "Stopped", None),
-            State::Ready(Snapshot::NotEnabled) => (theme.tints.amber.base, "Not set up", None),
-            State::Ready(Snapshot::Failed(_)) => (theme.tints.destructive.base, "Error", None),
+            State::Ready(Snapshot::Stopped) => (theme.muted_foreground, t("Stopped"), None),
+            State::Ready(Snapshot::NotEnabled) => (theme.tints.amber.base, t("Not set up"), None),
+            State::Ready(Snapshot::Failed(_)) => (theme.tints.destructive.base, t("Error"), None),
         };
 
         let buttons: Vec<AnyElement> = if let Some(busy) = self.busy {
@@ -203,16 +229,16 @@ impl LinoView {
         } else {
             match &self.state {
                 State::Ready(Snapshot::Running { .. }) => vec![
-                    ui::compact_button("lino-reindex", Some(IconName::RefreshCw), "Reindex", false, theme)
-                        .on_click(cx.listener(|this, _, _, cx| this.act("Reindexing…", lino::reindex, cx)))
+                    ui::compact_button("lino-reindex", Some(IconName::RefreshCw), t("Reindex"), false, theme)
+                        .on_click(cx.listener(|this, _, _, cx| this.act(t("Reindexing…"), lino::reindex, cx)))
                         .into_any_element(),
-                    ui::compact_button("lino-stop", Some(IconName::Square), "Stop", false, theme)
-                        .on_click(cx.listener(|this, _, _, cx| this.act("Stopping…", lino::stop, cx)))
+                    ui::compact_button("lino-stop", Some(IconName::Square), t("Stop"), false, theme)
+                        .on_click(cx.listener(|this, _, _, cx| this.act(t("Stopping…"), lino::stop, cx)))
                         .into_any_element(),
                 ],
                 State::Ready(Snapshot::Stopped | Snapshot::Failed(_)) => vec![
-                    ui::compact_button("lino-start", Some(IconName::Play), "Start", false, theme)
-                        .on_click(cx.listener(|this, _, _, cx| this.act("Starting…", lino::start, cx)))
+                    ui::compact_button("lino-start", Some(IconName::Play), t("Start"), false, theme)
+                        .on_click(cx.listener(|this, _, _, cx| this.act(t("Starting…"), lino::start, cx)))
                         .into_any_element(),
                 ],
                 _ => Vec::new(),
@@ -245,33 +271,31 @@ impl LinoView {
     /// The body when there's nothing to show yet: a message, maybe a button.
     fn render_message(&self, theme: &Theme, cx: &Context<Self>) -> AnyElement {
         let (title, text, button): (&str, String, Option<Stateful<Div>>) = match &self.state {
-            State::Checking => ("Checking lino…", String::new(), None),
+            State::Checking => (t("Checking lino…"), String::new(), None),
             State::Unavailable => (
-                "lino isn't installed",
-                "This build of xharness doesn't bundle lino for this platform, and there's no lino on PATH."
-                    .to_string(),
+                t("lino isn't installed"),
+                t("This build of xharness doesn't bundle lino for this platform, and there's no lino on PATH.").to_string(),
                 None,
             ),
             State::Ready(Snapshot::NotEnabled) => (
-                "lino isn't set up here",
-                "lino indexes this folder so agents can read, search and edit it in fewer tokens, \
-                 with every change recorded. Setting it up adds .lino/ and a .linoignore to the folder."
-                    .to_string(),
+                t("lino isn't set up here"),
+                t("lino indexes this folder so agents can read, search and edit it in fewer tokens, \
+                   with every change recorded. Setting it up adds .lino/ and a .linoignore to the folder.")
+                .to_string(),
                 Some(
-                    ui::compact_button("lino-enable", Some(IconName::Play), "Set up lino", true, theme)
-                        .on_click(cx.listener(|this, _, _, cx| this.act("Setting up…", lino::enable, cx))),
+                    ui::compact_button("lino-enable", Some(IconName::Play), t("Set up lino"), true, theme)
+                        .on_click(cx.listener(|this, _, _, cx| this.act(t("Setting up…"), lino::enable, cx))),
                 ),
             ),
             State::Ready(Snapshot::Stopped) => (
-                "lino isn't running",
-                "Its live process stops after a while idle. Agents' lino commands start it again, or start it now."
-                    .to_string(),
+                t("lino isn't running"),
+                t("Its live process stops after a while idle. Agents' lino commands start it again, or start it now.").to_string(),
                 Some(
-                    ui::compact_button("lino-start-body", Some(IconName::Play), "Start lino", true, theme)
-                        .on_click(cx.listener(|this, _, _, cx| this.act("Starting…", lino::start, cx))),
+                    ui::compact_button("lino-start-body", Some(IconName::Play), t("Start lino"), true, theme)
+                        .on_click(cx.listener(|this, _, _, cx| this.act(t("Starting…"), lino::start, cx))),
                 ),
             ),
-            State::Ready(Snapshot::Failed(error)) => ("lino didn't answer", error.clone(), None),
+            State::Ready(Snapshot::Failed(error)) => (t("lino didn't answer"), error.clone(), None),
             State::Ready(Snapshot::Running { .. }) => unreachable!("rendered by render_running"),
         };
         let button = if self.busy.is_some() { None } else { button };
@@ -307,19 +331,19 @@ impl LinoView {
         let calls: u64 = commands.iter().map(|c| c.count).sum();
 
         let tiles = [
-            ("Files", lino::group_digits(status.totals.files), None),
-            ("Lines", lino::group_digits(status.totals.lines), None),
-            ("Changes", lino::group_digits(stats.history.changes), None),
-            ("Calls", lino::group_digits(calls), None),
+            (t("Files"), lino::group_digits(status.totals.files), None),
+            (t("Lines"), lino::group_digits(status.totals.lines), None),
+            (t("Changes"), lino::group_digits(stats.history.changes), None),
+            (t("Calls"), lino::group_digits(calls), None),
             (
-                "Memory",
+                t("Memory"),
                 format_size(stats.process.peak_rss_bytes),
-                Some(format!("heap {}", format_size(stats.process.heap_bytes))),
+                Some(tf("heap {}", &[&format_size(stats.process.heap_bytes)])),
             ),
             (
-                "On disk",
+                t("On disk"),
                 format_size(stats.index.db_bytes + stats.history.db_bytes),
-                Some(format!("history {}", format_size(stats.history.db_bytes))),
+                Some(tf("history {}", &[&format_size(stats.history.db_bytes)])),
             ),
         ];
         let mut tiles: Vec<Div> = tiles
@@ -329,23 +353,20 @@ impl LinoView {
         let second_row = tiles.split_off(3);
 
         let last_sync = status.last_reconcile.as_ref().map(|r| {
-            let when = lino::ago(&r.at, now).unwrap_or_default();
-            format!(
-                "{when} · {} ms · +{} ~{} −{} ↻{}",
-                r.duration_ms, r.added, r.modified, r.removed, r.moved
-            )
+            let when = ago(&r.at, now).unwrap_or_default();
+            tf("{} · {} ms · +{} ~{} −{} ↻{}", &[&when, &r.duration_ms, &r.added, &r.modified, &r.removed, &r.moved])
         });
         let rate = |outcome: &str| {
             stats.rates.iter().find(|r| r.outcome == outcome).map_or("–".to_string(), |r| {
                 if r.of == 0 {
                     "–".to_string()
                 } else {
-                    format!("{:.1}% · {} of {}", r.count as f64 * 100. / r.of as f64, r.count, r.of)
+                    tf("{}% · {} of {}", &[&format!("{:.1}", r.count as f64 * 100. / r.of as f64), &r.count, &r.of])
                 }
             })
         };
         let reindex = if stats.reindex.count == 0 {
-            "none yet".to_string()
+            t("none yet").to_string()
         } else {
             format!(
                 "{} · p50 {} · p95 {}",
@@ -375,28 +396,28 @@ impl LinoView {
                             .child(div().flex().gap_2().children(second_row)),
                     )
                     .child(
-                        section("Index", theme)
-                            .child(row("Watcher", status.watcher.clone(), theme))
-                            .child(row("Waiting to index", format!("{} files", status.pending), theme))
+                        section(t("Index"), theme)
+                            .child(row(t("Watcher"), status.watcher.clone(), theme))
+                            .child(row(t("Waiting to index"), tn(status.pending as usize, "{} file", "{} files"), theme))
                             .when(status.totals.binary > 0, |el| {
-                                el.child(row("Binary files", lino::group_digits(status.totals.binary), theme))
+                                el.child(row(t("Binary files"), lino::group_digits(status.totals.binary), theme))
                             })
-                            .children(last_sync.map(|text| row("Last sync", text, theme))),
+                            .children(last_sync.map(|text| row(t("Last sync"), text, theme))),
                     )
                     .child(
-                        section("Edits", theme)
-                            .child(row("Conflicts", rate("conflict"), theme))
-                            .child(row("Anchor mismatches", rate("anchor_mismatch"), theme))
-                            .child(row("Changed outside lino", lino::group_digits(stats.external), theme))
-                            .child(row("Reindexes", reindex, theme)),
+                        section(t("Edits"), theme)
+                            .child(row(t("Conflicts"), rate("conflict"), theme))
+                            .child(row(t("Anchor mismatches"), rate("anchor_mismatch"), theme))
+                            .child(row(t("Changed outside lino"), lino::group_digits(stats.external), theme))
+                            .child(row(t("Reindexes"), reindex, theme)),
                     )
-                    .child(section("Commands", theme).child(if commands.is_empty() {
-                        empty_note("No calls yet. Agents use lino from a terminal; `lino help --agent` prints the instructions to give them.", theme)
+                    .child(section(t("Commands"), theme).child(if commands.is_empty() {
+                        empty_note(t("No calls yet. Agents use lino from a terminal; `lino help --agent` prints the instructions to give them."), theme)
                     } else {
                         commands_table(&commands, theme)
                     }))
-                    .child(section("Recent changes", theme).child(if self.history.is_empty() {
-                        empty_note("No changes yet.", theme)
+                    .child(section(t("Recent changes"), theme).child(if self.history.is_empty() {
+                        empty_note(t("No changes yet."), theme)
                     } else {
                         div()
                             .flex()
@@ -417,9 +438,9 @@ impl Render for LinoView {
             _ => self.render_message(theme, cx),
         };
         let source = if self.bundled {
-            format!("lino {} · bundled", lino::VERSION)
+            tf("lino {} · bundled", &[&lino::VERSION])
         } else {
-            "lino from PATH".to_string()
+            t("lino from PATH").to_string()
         };
 
         div()
@@ -539,11 +560,11 @@ fn commands_table(commands: &[&CommandStats], theme: &Theme) -> AnyElement {
         .pb_1()
         .text_size(rems(0.6875))
         .text_color(theme.muted_foreground)
-        .child(div().flex_1().child("Command"))
-        .child(cell("Calls".into()))
+        .child(div().flex_1().child(t("Command")))
+        .child(cell(t("Calls").into()))
         .child(cell("p50".into()))
         .child(cell("p95".into()))
-        .child(cell("Max".into()));
+        .child(cell(t("Max").into()));
     div()
         .flex()
         .flex_col()
@@ -574,7 +595,7 @@ fn commands_table(commands: &[&CommandStats], theme: &Theme) -> AnyElement {
                                 div()
                                     .text_size(rems(0.6875))
                                     .text_color(theme.tints.amber.soft_foreground)
-                                    .child(format!("{failures} not ok")),
+                                    .child(tf("{} not ok", &[&failures])),
                             )
                         }),
                 )
@@ -587,7 +608,7 @@ fn commands_table(commands: &[&CommandStats], theme: &Theme) -> AnyElement {
 }
 
 fn change_row(change: &Change, now: i64, theme: &Theme) -> impl IntoElement {
-    let when = lino::ago(&change.time, now).unwrap_or_default();
+    let when = ago(&change.time, now).unwrap_or_default();
     let meta = match &change.author {
         Some(author) if !author.is_empty() => format!("{author} · {when}"),
         _ => when,
@@ -625,4 +646,17 @@ fn change_row(change: &Change, now: i64, theme: &Theme) -> impl IntoElement {
                 .text_color(theme.muted_foreground)
                 .child(meta),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn times_read_as_how_long_ago() {
+        assert_eq!(ago("2026-11-01T21:08:34+03:00", 1_793_556_514 + 300).as_deref(), Some("5m ago"));
+        assert_eq!(ago("2026-11-01T21:08:34+03:00", 1_793_556_514 + 2).as_deref(), Some("just now"));
+        assert_eq!(format_ago(3 * 86_400 + 5), "3d ago");
+        assert_eq!(format_span(2 * 3600 + 5 * 60), "2h 5m");
+    }
 }

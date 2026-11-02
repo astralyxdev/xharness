@@ -6,10 +6,12 @@
 //!
 //! Which are uninstalled is saved in `mods.json` in the data directory.
 
+pub mod browser;
 pub mod editor;
 pub mod explorer;
 pub mod git;
 pub mod lino;
+pub mod sftp;
 pub mod terminal;
 
 use std::collections::BTreeSet;
@@ -52,6 +54,16 @@ pub const MODS: &[Mod] = &[
         kind: ItemKind::Git,
         name: "Git",
         description: "Changes, commits, branches and history with its branch graph, like GitHub Desktop.",
+    },
+    Mod {
+        kind: ItemKind::Browser,
+        name: "Browser",
+        description: "Web pages with back, forward and an address bar, at the window's size or an iPhone's, iPad's or desktop's.",
+    },
+    Mod {
+        kind: ItemKind::Sftp,
+        name: "SFTP",
+        description: "Your servers' files next to the project's, like FileZilla: add any number of servers, drag files across, watch the transfers.",
     },
     Mod {
         kind: ItemKind::Lino,

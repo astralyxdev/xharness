@@ -5,15 +5,21 @@
 mod footer;
 mod home;
 pub mod marketplace;
+#[cfg(unix)]
+pub mod instance;
+pub mod palette;
 pub mod project_dialog;
 pub mod servers;
+pub mod settings;
+mod settings_page;
 mod sidebar;
+mod titlebar;
 
 use std::{collections::HashMap, path::PathBuf};
 
 use gpui::{
     AnyElement, AnyView, App, ClickEvent, Context, DismissEvent, ElementId, Entity, EntityId, Focusable,
-    FontWeight, MouseButton, MouseDownEvent, Pixels, Point, Subscription, Window, actions, anchored, deferred,
+    FontWeight, MouseButton, MouseDownEvent, Pixels, Point, Subscription, Task, Window, actions, anchored, deferred,
     WindowControlArea, div, prelude::*, px, relative,
 };
 
@@ -21,7 +27,7 @@ use crate::ui::actions::{Cancel, Confirm};
 use crate::ui::alert_dialog::{AlertDialog, AlertDialogEvent};
 use crate::ui::assets::{self, IconName};
 use crate::canvas::{CanvasEvent, ProjectCanvas};
-use crate::ui::context_menu::{ContextMenu, MenuEntry};
+use crate::ui::context_menu::{ContextMenu, MenuAt, MenuEntry};
 use project_dialog::{DialogTarget, ProjectDialog, ProjectDialogEvent};
 use crate::services::projects::{ItemKind, Project, ProjectItem, ProjectStore};
 use crate::services::{lino, server};
@@ -29,7 +35,8 @@ use crate::windows::Mods;
 #[cfg(target_os = "macos")]
 use crate::platform::macos;
 use crate::ui::text_input::TextInput;
-use crate::ui::theme::{FONT_MONO, Mode, Theme, radius};
+use crate::i18n::{t, tf, tn};
+use crate::ui::theme::{Mode, Theme, radius};
 use crate::ui::{self, Button, ButtonSize, Variant};
 
 /// Window gutter: `p-2` around the frame and `gap-2` between rail and panel.
@@ -62,18 +69,21 @@ pub const RENAME_CONTEXT: &str = "ProjectRename";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Page {
     Home,
-    /// Language servers to install.
+    /// Mods and language servers to install.
     Marketplace,
+    /// Profile, language, look, canvas.
+    Settings,
 }
 
 impl Page {
     /// Sidebar order.
-    const ALL: [Page; 2] = [Page::Home, Page::Marketplace];
+    const ALL: [Page; 3] = [Page::Home, Page::Marketplace, Page::Settings];
 
     fn label(self) -> &'static str {
         match self {
             Page::Home => "Home",
             Page::Marketplace => "Marketplace",
+            Page::Settings => "Settings",
         }
     }
 
@@ -81,6 +91,7 @@ impl Page {
         match self {
             Page::Home => IconName::House,
             Page::Marketplace => IconName::Store,
+            Page::Settings => IconName::Settings,
         }
     }
 }
@@ -100,6 +111,8 @@ enum MenuTarget {
     Item(u64),
     /// A project's "New window" row.
     NewWindow(u64),
+    /// The profile in the title bar.
+    Profile,
 }
 
 /// An open menu, shown at `position` (window coordinates).
@@ -107,6 +120,8 @@ struct OpenMenu {
     menu: Entity<ContextMenu>,
     target: MenuTarget,
     position: Point<Pixels>,
+    /// Which of the menu's corners sits at `position`.
+    corner: gpui::Corner,
     _subscription: Subscription,
 }
 
@@ -131,16 +146,22 @@ pub struct AppShell {
     /// windows, so they keep running while you look at another project.
     canvases: HashMap<u64, (Entity<ProjectCanvas>, [Subscription; 2])>,
     menu: Option<OpenMenu>,
+    /// Where the sidebar's and title bar's dropdown buttons are (see
+    /// [`ui::Anchors`]).
+    anchors: ui::Anchors,
     modal: Option<Modal>,
     rename: Option<Rename>,
-    /// `None` follows the macOS appearance; `Some` is a manual choice.
-    mode_override: Option<Mode>,
     marketplace: Entity<marketplace::MarketplaceView>,
+    settings_view: Entity<settings_page::SettingsView>,
     /// Which servers answer (this machine's, each remote project's).
     servers: Entity<servers::Servers>,
     /// Servers that answered at the last check: one that comes back gets
     /// its projects read again.
     connected: std::collections::HashSet<Option<server::ServerKey>>,
+    /// The selected project's branch and changes (by project id), for the
+    /// footer.
+    git_summary: Option<(u64, footer::GitSummary)>,
+    _git_watch: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -156,6 +177,8 @@ impl AppShell {
                 this.apply_theme(window, cx);
             }),
             cx.observe(&projects, |_, _, cx| cx.notify()),
+            // Light or dark, the profile, the language.
+            cx.observe_global_in::<settings::Settings>(window, |this, window, cx| this.apply_theme(window, cx)),
             // An uninstalled mod's windows close everywhere.
             cx.observe_global::<Mods>(|this, cx| {
                 for (canvas, _) in this.canvases.values() {
@@ -201,12 +224,15 @@ impl AppShell {
             projects,
             canvases: HashMap::new(),
             menu: None,
+            anchors: ui::Anchors::default(),
             modal: None,
             rename: None,
-            mode_override: None,
             marketplace: marketplace::new(cx),
+            settings_view: settings_page::new(cx),
             servers,
             connected: Default::default(),
+            git_summary: None,
+            _git_watch: Self::watch_git(cx),
             _subscriptions: subscriptions,
         };
         this.apply_theme(window, cx);
@@ -214,9 +240,15 @@ impl AppShell {
     }
 
     fn apply_theme(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let mode = self
-            .mode_override
-            .unwrap_or_else(|| Mode::from(window.appearance()));
+        let mode = match settings::Settings::get(cx).appearance {
+            settings::Appearance::System => Mode::from(window.appearance()),
+            settings::Appearance::Light => Mode::Light,
+            settings::Appearance::Dark => Mode::Dark,
+        };
+        if cx.try_global::<Theme>().is_some_and(|theme| theme.mode == mode) {
+            cx.notify();
+            return;
+        }
         cx.set_global(Theme::for_mode(mode));
         // Windows on the canvas are cached views; a refresh renders them all
         // again, in the new colors.
@@ -286,12 +318,16 @@ impl AppShell {
             cx.observe(&canvas, |_, _, cx| cx.notify()),
             // Window menus (from a window's header) are shown by the shell.
             cx.subscribe_in(&canvas, window, move |this, canvas, event, window, cx| match event {
-                CanvasEvent::ItemMenu { item, position } => {
-                    this.open_item_menu(id, *item, *position, window, cx)
+                // Under the header's … button, or at the pointer for a
+                // right-click.
+                CanvasEvent::ItemMenu { item, at } => {
+                    let at = at.unwrap_or_else(|| window.mouse_position().into());
+                    this.open_item_menu(id, *item, at, window, cx)
                 }
                 CanvasEvent::Menu { item, entries, position } => {
                     this.show_menu(MenuTarget::Item(*item), entries.clone(), *position, window, cx)
                 }
+                CanvasEvent::NewWindowMenu(at) => this.open_new_window_menu(id, *at, window, cx),
                 CanvasEvent::OpenTerminal { folder, next_to } => {
                     let (folder, next_to) = (folder.clone(), *next_to);
                     canvas.update(cx, |canvas, cx| canvas.add_terminal_in(folder, next_to, window, cx));
@@ -355,8 +391,20 @@ impl AppShell {
         canvas.update(cx, |canvas, cx| canvas.add_terminal(false, window, cx));
     }
 
+    fn new_browser(&mut self, project: u64, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_project(project, window, cx);
+        let canvas = self.canvas(project, window, cx);
+        canvas.update(cx, |canvas, cx| canvas.add_browser(Default::default(), None, window, cx));
+    }
+
+    pub(crate) fn new_sftp(&mut self, project: u64, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_project(project, window, cx);
+        let canvas = self.canvas(project, window, cx);
+        canvas.update(cx, |canvas, cx| canvas.add_sftp(Default::default(), None, window, cx));
+    }
+
     /// "New window": a menu of the windows a project can have.
-    fn open_new_window_menu(&mut self, id: u64, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_new_window_menu(&mut self, id: u64, position: impl Into<MenuAt>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(project) = self.project(id, cx) else {
             return;
         };
@@ -372,10 +420,16 @@ impl AppShell {
         let installed = |kind| Mods::installed(kind, cx);
         let mut entries = Vec::new();
         if installed(ItemKind::Terminal) {
-            entries.push(MenuEntry::item(IconName::SquareTerminal, "Terminal", action(Self::new_terminal)));
+            entries.push(MenuEntry::item(IconName::SquareTerminal, t("Terminal"), action(Self::new_terminal)));
         }
         if installed(ItemKind::Explorer) {
-            entries.push(MenuEntry::item(IconName::FolderTree, "Explorer", action(Self::open_explorer_window)));
+            entries.push(MenuEntry::item(IconName::FolderTree, t("Explorer"), action(Self::open_explorer_window)));
+        }
+        if installed(ItemKind::Browser) {
+            entries.push(MenuEntry::item(IconName::Globe, t("Browser"), action(Self::new_browser)));
+        }
+        if installed(ItemKind::Sftp) {
+            entries.push(MenuEntry::item(IconName::Server, "SFTP", action(Self::new_sftp)));
         }
         if has_folder && installed(ItemKind::Git) {
             entries.push(MenuEntry::item(IconName::GitBranch, "Git", action(|this, id, window, cx| {
@@ -388,7 +442,7 @@ impl AppShell {
             })));
         }
         if entries.is_empty() {
-            entries.push(MenuEntry::item(IconName::Store, "Get mods in the Marketplace", {
+            entries.push(MenuEntry::item(IconName::Store, t("Get mods in the Marketplace"), {
                 let shell = shell.clone();
                 move |_, cx| {
                     shell
@@ -450,9 +504,9 @@ impl AppShell {
     ) {
         let alert = cx.new(|cx| {
             AlertDialog::destructive(
-                format!("Discard changes to “{name}”?"),
-                "Your changes to this file haven't been saved.",
-                "Discard changes",
+                tf("Discard changes to “{}”?", &[&name]),
+                t("Your changes to this file haven't been saved."),
+                t("Discard changes"),
                 window,
                 cx,
             )
@@ -490,10 +544,10 @@ impl AppShell {
             return false;
         }
         let description = match unsaved.as_slice() {
-            [one] => format!("“{one}” has changes that haven't been saved."),
-            many => format!("{} files have changes that haven't been saved: {}.", many.len(), many.join(", ")),
+            [one] => tf("“{}” has changes that haven't been saved.", &[one]),
+            many => tf("{} files have changes that haven't been saved: {}.", &[&many.len(), &many.join(", ")]),
         };
-        let alert = cx.new(|cx| AlertDialog::destructive("Quit without saving?", description, "Quit anyway", window, cx));
+        let alert = cx.new(|cx| AlertDialog::destructive(t("Quit without saving?"), description, t("Quit anyway"), window, cx));
         let subscription = cx.subscribe(&alert, |this, alert, event, cx| {
             if let AlertDialogEvent::Confirm = event {
                 cx.quit();
@@ -524,7 +578,7 @@ impl AppShell {
             return;
         };
         let name = project.name.clone();
-        let input = cx.new(|cx| TextInput::new("Project name", cx).inline().with_text(name));
+        let input = cx.new(|cx| TextInput::new(t("Project name"), cx).inline().with_text(name));
         let focus = input.focus_handle(cx);
         window.focus(&focus);
         // Moving focus elsewhere saves, like clicking away does.
@@ -553,10 +607,11 @@ impl AppShell {
         &mut self,
         target: MenuTarget,
         entries: Vec<MenuEntry>,
-        position: Point<Pixels>,
+        position: impl Into<MenuAt>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let at = position.into();
         let menu = cx.new(|cx| ContextMenu::new(entries, window, cx));
         let subscription = cx.subscribe(&menu, |this, menu, _: &DismissEvent, cx| {
             // A click that dismisses this menu may already have opened the
@@ -569,7 +624,8 @@ impl AppShell {
         self.menu = Some(OpenMenu {
             menu,
             target,
-            position,
+            position: at.point,
+            corner: at.corner,
             _subscription: subscription,
         });
         cx.notify();
@@ -578,7 +634,7 @@ impl AppShell {
     fn open_project_menu(
         &mut self,
         id: u64,
-        position: Point<Pixels>,
+        position: impl Into<MenuAt>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -598,24 +654,24 @@ impl AppShell {
         let entries = vec![
             MenuEntry::item(
                 IconName::SquareTerminal,
-                "New terminal",
+                t("New terminal"),
                 action(Self::new_terminal),
             ),
-            MenuEntry::item(IconName::FolderTree, "New explorer", action(Self::new_explorer)),
+            MenuEntry::item(IconName::FolderTree, t("New explorer"), action(Self::new_explorer)),
             MenuEntry::Separator,
-            MenuEntry::item(IconName::Pencil, "Rename", action(Self::start_rename)),
+            MenuEntry::item(IconName::Pencil, t("Rename"), action(Self::start_rename)),
             MenuEntry::item(
                 IconName::Paintbrush,
-                "Change icon & color…",
+                t("Change icon & color…"),
                 action(Self::open_edit_dialog),
             ),
             if pinned {
-                MenuEntry::item(IconName::PinOff, "Unpin", action(Self::toggle_pin))
+                MenuEntry::item(IconName::PinOff, t("Unpin"), action(Self::toggle_pin))
             } else {
-                MenuEntry::item(IconName::Pin, "Pin", action(Self::toggle_pin))
+                MenuEntry::item(IconName::Pin, t("Pin"), action(Self::toggle_pin))
             },
             MenuEntry::Separator,
-            MenuEntry::destructive(IconName::Trash, "Delete…", action(Self::confirm_delete)),
+            MenuEntry::destructive(IconName::Trash, t("Delete…"), action(Self::confirm_delete)),
         ];
         self.show_menu(MenuTarget::Project(id), entries, position, window, cx);
     }
@@ -624,7 +680,7 @@ impl AppShell {
         &mut self,
         project: u64,
         item: u64,
-        position: Point<Pixels>,
+        position: impl Into<MenuAt>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -644,9 +700,9 @@ impl AppShell {
             }
         };
         let open_or_close = if open {
-            MenuEntry::item(IconName::X, "Close window", action(Self::close_item))
+            MenuEntry::item(IconName::X, t("Close window"), action(Self::close_item))
         } else {
-            MenuEntry::item(kind.icon(), "Open", action(Self::open_item))
+            MenuEntry::item(kind.icon(), t("Open"), action(Self::open_item))
         };
         if permanent {
             // Every project has its first Explorer and Lino: they open and
@@ -657,20 +713,20 @@ impl AppShell {
         if kind == ItemKind::Editor {
             // Closing an editor takes it out of the project.
             let entries = vec![
-                MenuEntry::item(IconName::Pencil, "Rename…", action(Self::open_window_dialog)),
-                MenuEntry::item(IconName::Paintbrush, "Change color…", action(Self::open_window_dialog)),
+                MenuEntry::item(IconName::Pencil, t("Rename…"), action(Self::open_window_dialog)),
+                MenuEntry::item(IconName::Paintbrush, t("Change color…"), action(Self::open_window_dialog)),
                 MenuEntry::Separator,
-                MenuEntry::item(IconName::X, "Close editor", action(Self::close_item)),
+                MenuEntry::item(IconName::X, t("Close editor"), action(Self::close_item)),
             ];
             self.show_menu(MenuTarget::Item(item), entries, position, window, cx);
             return;
         }
         let entries = vec![
             // Both open the window dialog, which has the name and color.
-            MenuEntry::item(IconName::Pencil, "Rename…", action(Self::open_window_dialog)),
+            MenuEntry::item(IconName::Pencil, t("Rename…"), action(Self::open_window_dialog)),
             MenuEntry::item(
                 IconName::Paintbrush,
-                "Change color…",
+                t("Change color…"),
                 action(Self::open_window_dialog),
             ),
             MenuEntry::Separator,
@@ -753,22 +809,24 @@ impl AppShell {
         let Some(project) = self.project(id, cx) else {
             return;
         };
-        let title = format!("Delete “{}”?", project.name);
+        let title = tf("Delete “{}”?", &[&project.name]);
         let terminals = project.items.iter().filter(|i| i.kind == ItemKind::Terminal).count();
-        let running = match terminals {
-            0 => String::new(),
-            1 => " and ends anything running in its window".to_string(),
-            n => format!(" and ends anything running in its {n} windows"),
+        let removes = match terminals {
+            0 => t("This removes the project from XHarness.").to_string(),
+            n => tn(n, "This removes the project from XHarness and ends anything running in its {} terminal.", "This removes the project from XHarness and ends anything running in its {} terminals."),
         };
         let description = match &project.folder {
             Some(folder) => format!(
-                "This removes the project from xharness{running}. Its .xharness folder stays in {}, so adding that folder again brings the layout back.",
-                ui::display_path(folder)
+                "{removes} {}",
+                tf(
+                    "Its .xharness folder stays in {}, so adding that folder again brings the layout back.",
+                    &[&ui::display_path(folder)]
+                )
             ),
-            None => format!("This removes the project from xharness{running}. It can't be undone."),
+            None => format!("{removes} {}", t("It can't be undone.")),
         };
         let alert = cx.new(|cx| {
-            AlertDialog::destructive(title, description, "Delete project", window, cx)
+            AlertDialog::destructive(title, description, t("Delete project"), window, cx)
         });
         let subscription = cx.subscribe(&alert, move |this, alert, event, cx| {
             if let AlertDialogEvent::Confirm = event {
@@ -853,6 +911,11 @@ impl AppShell {
                     .min_h_0()
                     .child(self.marketplace.clone())
                     .into_any_element(),
+                (Selection::Page(Page::Settings), _) => div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.settings_view.clone())
+                    .into_any_element(),
                 _ => self.render_home(theme, cx),
             })
     }
@@ -875,34 +938,28 @@ impl Render for AppShell {
             .on_action(cx.listener(|this, _: &Quit, window, cx| {
                 this.quit(window, cx);
             }))
-            .child(
-                // The title bar, with the traffic lights at its left. macOS
-                // drags the window from it; double-click zooms. Elsewhere it's
-                // a drag area with our own caption buttons, which the system
-                // handles (so Windows' snap layouts work on Maximize).
-                div()
-                    .id("titlebar")
-                    .relative()
-                    .flex()
-                    .flex_shrink_0()
-                    .items_center()
-                    .justify_center()
-                    .h(px(TITLEBAR_HEIGHT))
-                    .bg(gpui::rgb(TITLEBAR_COLOR))
-                    .text_size(px(13.))
-                    .line_height(px(16.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(gpui::white())
-                    .map(|bar| {
-                        if cfg!(target_os = "macos") {
-                            bar.on_click(titlebar_double_click)
-                        } else {
-                            bar.window_control_area(WindowControlArea::Drag)
-                        }
-                    })
-                    .child("XHarness")
-                    .when(!cfg!(target_os = "macos"), |bar| bar.child(caption_buttons())),
-            )
+            // Files dragged out of the window (from an Explorer) become a
+            // real file drag, which other apps take.
+            .on_drag_move(cx.listener(|_, event: &gpui::DragMoveEvent<crate::windows::explorer::DraggedFiles>, window, cx| {
+                let position = event.event.position;
+                let size = window.viewport_size();
+                let outside = position.x < px(1.) || position.y < px(1.) || position.x > size.width - px(1.) || position.y > size.height - px(1.);
+                #[cfg(target_os = "macos")]
+                if outside {
+                    let paths = event.drag(cx).0.clone();
+                    if crate::platform::drag_out::begin(window, &paths) {
+                        cx.stop_active_drag(window);
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                let _ = (outside, cx);
+            }))
+            .on_action(cx.listener(|this, _: &palette::OpenCommandPalette, window, cx| {
+                if this.modal.is_none() {
+                    this.open_palette(window, cx);
+                }
+            }))
+            .child(self.render_titlebar(theme, cx))
             .child(
                 // SidebarProvider (variant "app"): p-2 gap-2 on the sidebar
                 // color.
@@ -916,20 +973,31 @@ impl Render for AppShell {
                     .child(self.render_inset(theme, cx)),
             )
             .child(self.render_footer(theme, cx))
-            .when_some(self.modal.as_ref(), |el, modal| el.child(modal.view.clone()))
+            // A dialog covers the window, Browser pages included.
+            .when_some(self.modal.as_ref(), |el, modal| {
+                el.child(modal.view.clone()).child(crate::windows::browser::layers::occluder())
+            })
             // Menus paint above everything and open down-right from the
             // pointer, kept 8px inside the window.
             .when_some(self.menu.as_ref(), |el, open| {
                 el.child(
                     deferred(
                         anchored()
+                            .anchor(open.corner)
                             .position(open.position)
                             .snap_to_window_with_margin(px(GUTTER))
-                            .child(open.menu.clone()),
+                            .child(
+                                div()
+                                    .relative()
+                                    .child(open.menu.clone())
+                                    .child(crate::windows::browser::layers::occluder()),
+                            ),
                     )
                     .with_priority(1),
                 )
             })
+            // Places Browser pages, after everything above has painted.
+            .child(crate::windows::browser::layers::sweeper())
     }
 }
 

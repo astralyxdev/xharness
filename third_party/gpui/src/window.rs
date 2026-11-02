@@ -533,6 +533,9 @@ pub struct Hitbox {
     pub content_mask: ContentMask<Pixels>,
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
+    /// (XHarness) How the subtree it's in is drawn: hit testing maps the
+    /// pointer back into `bounds`' units.
+    pub transform: ElementTransform,
 }
 
 impl Hitbox {
@@ -660,6 +663,8 @@ pub(crate) struct DeferredDraw {
     text_style_stack: Vec<TextStyleRefinement>,
     element: Option<AnyElement>,
     absolute_offset: Point<Pixels>,
+    /// (XHarness) The transform where it was deferred.
+    transform: ElementTransform,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
 }
@@ -777,7 +782,7 @@ impl Frame {
         let mut hit_test = HitTest::default();
         for hitbox in self.hitboxes.iter().rev() {
             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
-            if bounds.contains(&position) {
+            if bounds.contains(&hitbox.transform.invert(position)) {
                 hit_test.ids.push(hitbox.id);
                 if !set_hover_hitbox_count
                     && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll
@@ -838,6 +843,9 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
+    /// (XHarness) How what's being drawn now is scaled (see `with_zoom`).
+    pub(crate) element_transform: ElementTransform,
+    /// In window coordinates (not the current transform's).
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
@@ -1223,6 +1231,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
+            element_transform: ElementTransform::default(),
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -1273,6 +1282,86 @@ impl Window {
 pub(crate) struct DispatchEventResult {
     pub propagate: bool,
     pub default_prevented: bool,
+}
+
+/// (XHarness) How a subtree is drawn: a point `p` it lays out lands on the
+/// window at `p * scale + offset`. Layout, hit testing and the events its
+/// listeners get all stay in the subtree's own (unscaled) units; only what's
+/// painted is scaled, sharply (text is rasterized at the drawn size). See
+/// [`Window::with_zoom`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ElementTransform {
+    /// Window px per layout px.
+    pub scale: f32,
+    /// Where the layout's origin lands.
+    pub offset: Point<Pixels>,
+}
+
+impl Default for ElementTransform {
+    fn default() -> Self {
+        Self {
+            scale: 1.,
+            offset: Point::default(),
+        }
+    }
+}
+
+impl ElementTransform {
+    /// Draws as laid out.
+    pub fn is_identity(&self) -> bool {
+        self.scale == 1. && self.offset.is_zero()
+    }
+
+    /// Where a laid-out point is drawn.
+    pub fn apply(&self, point: Point<Pixels>) -> Point<Pixels> {
+        Point {
+            x: point.x * self.scale + self.offset.x,
+            y: point.y * self.scale + self.offset.y,
+        }
+    }
+
+    /// Where laid-out bounds are drawn.
+    pub fn apply_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        if self.is_identity() {
+            return bounds;
+        }
+        Bounds {
+            origin: self.apply(bounds.origin),
+            size: bounds.size.map(|length| length * self.scale),
+        }
+    }
+
+    /// The laid-out point drawn at `point`.
+    pub fn invert(&self, point: Point<Pixels>) -> Point<Pixels> {
+        Point {
+            x: (point.x - self.offset.x) / self.scale,
+            y: (point.y - self.offset.y) / self.scale,
+        }
+    }
+
+    /// The laid-out bounds drawn at `bounds`.
+    pub fn invert_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        if self.is_identity() {
+            return bounds;
+        }
+        Bounds {
+            origin: self.invert(bounds.origin),
+            size: bounds.size.map(|length| length / self.scale),
+        }
+    }
+
+    /// This transform, then zooming by `zoom` around the laid-out point
+    /// `origin` (which stays where it is drawn).
+    pub fn zoomed(&self, origin: Point<Pixels>, zoom: f32) -> Self {
+        // local(p) = p * zoom + origin * (1 - zoom); self(q) = q * s + o.
+        Self {
+            scale: self.scale * zoom,
+            offset: Point {
+                x: origin.x * (1. - zoom) * self.scale + self.offset.x,
+                y: origin.y * (1. - zoom) * self.scale + self.offset.y,
+            },
+        }
+    }
 }
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
@@ -2170,10 +2259,13 @@ impl Window {
 
             let prepaint_start = self.prepaint_index();
             if let Some(element) = deferred_draw.element.as_mut() {
+                let transform = deferred_draw.transform;
                 self.with_rendered_view(deferred_draw.current_view, |window| {
-                    window.with_absolute_element_offset(deferred_draw.absolute_offset, |window| {
-                        element.prepaint(window, cx)
-                    });
+                    window.with_element_transform(transform, |window| {
+                        window.with_absolute_element_offset(deferred_draw.absolute_offset, |window| {
+                            element.prepaint(window, cx)
+                        });
+                    })
                 })
             } else {
                 self.reuse_prepaint(deferred_draw.prepaint_range.clone());
@@ -2205,8 +2297,9 @@ impl Window {
 
             let paint_start = self.paint_index();
             if let Some(element) = deferred_draw.element.as_mut() {
+                let transform = deferred_draw.transform;
                 self.with_rendered_view(deferred_draw.current_view, |window| {
-                    element.paint(window, cx);
+                    window.with_element_transform(transform, |window| element.paint(window, cx));
                 })
             } else {
                 self.reuse_paint(deferred_draw.paint_range.clone());
@@ -2272,6 +2365,7 @@ impl Window {
                     priority: deferred_draw.priority,
                     element: None,
                     absolute_offset: deferred_draw.absolute_offset,
+                    transform: deferred_draw.transform,
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
                 }),
@@ -2388,7 +2482,10 @@ impl Window {
     ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
         if let Some(mask) = mask {
-            let mask = mask.intersect(&self.content_mask());
+            let mask = ContentMask {
+                bounds: self.element_transform.apply_bounds(mask.bounds),
+            }
+            .intersect(&self.window_content_mask());
             self.content_mask_stack.push(mask);
             let result = f(self);
             self.content_mask_stack.pop();
@@ -2549,6 +2646,46 @@ impl Window {
 
     /// Obtain the current content mask. This method should only be called during element drawing.
     pub fn content_mask(&self) -> ContentMask<Pixels> {
+        let mask = self.window_content_mask();
+        ContentMask {
+            bounds: self.element_transform.invert_bounds(mask.bounds),
+        }
+    }
+
+    /// (XHarness) How what's being drawn now is scaled and moved (see
+    /// [`Self::with_zoom`]).
+    pub fn element_transform(&self) -> ElementTransform {
+        self.element_transform
+    }
+
+    /// (XHarness) Draws `f`'s elements zoomed by `zoom` around `origin`, a
+    /// point in their layout that stays put. They lay out, hit test and get
+    /// events as if unzoomed; only the drawing scales, so text and sizes
+    /// inside don't change with the zoom. Call it in prepaint and in paint.
+    pub fn with_zoom<R>(&mut self, origin: Point<Pixels>, zoom: f32, f: impl FnOnce(&mut Self) -> R) -> R {
+        let transform = self.element_transform.zoomed(origin, zoom);
+        self.with_element_transform(transform, f)
+    }
+
+    pub(crate) fn with_element_transform<R>(&mut self, transform: ElementTransform, f: impl FnOnce(&mut Self) -> R) -> R {
+        let previous = mem::replace(&mut self.element_transform, transform);
+        let result = f(self);
+        self.element_transform = previous;
+        result
+    }
+
+    /// Bounds laid out in the current transform, in device pixels.
+    fn device_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
+        self.element_transform.apply_bounds(bounds).scale(self.scale_factor)
+    }
+
+    /// Device pixels per layout pixel in the current transform.
+    fn device_scale(&self) -> f32 {
+        self.scale_factor * self.element_transform.scale
+    }
+
+    /// The current content mask in window coordinates.
+    pub(crate) fn window_content_mask(&self) -> ContentMask<Pixels> {
         self.invalidator.debug_assert_paint_or_prepaint();
         self.content_mask_stack
             .last()
@@ -2769,6 +2906,7 @@ impl Window {
             priority,
             element: Some(element),
             absolute_offset,
+            transform: self.element_transform,
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
         });
@@ -2783,8 +2921,8 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let content_mask = self.content_mask();
-        let clipped_bounds = bounds.intersect(&content_mask.bounds);
+        let content_mask = self.window_content_mask();
+        let clipped_bounds = self.element_transform.apply_bounds(bounds).intersect(&content_mask.bounds);
         if !clipped_bounds.is_empty() {
             self.next_frame
                 .scene
@@ -2812,16 +2950,18 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let content_mask = self.content_mask();
+        let device_scale = self.device_scale();
+        let content_mask = self.window_content_mask();
         let opacity = self.element_opacity();
         for shadow in shadows {
             let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
+            let shadow_bounds = self.device_bounds(shadow_bounds);
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
-                blur_radius: shadow.blur_radius.scale(scale_factor),
-                bounds: shadow_bounds.scale(scale_factor),
+                blur_radius: shadow.blur_radius.scale(device_scale),
+                bounds: shadow_bounds,
                 content_mask: content_mask.scale(scale_factor),
-                corner_radii: corner_radii.scale(scale_factor),
+                corner_radii: corner_radii.scale(device_scale),
                 color: shadow.color.opacity(opacity),
             });
         }
@@ -2840,16 +2980,18 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let content_mask = self.content_mask();
+        let device_scale = self.device_scale();
+        let content_mask = self.window_content_mask();
         let opacity = self.element_opacity();
+        let bounds = self.device_bounds(quad.bounds);
         self.next_frame.scene.insert_primitive(Quad {
             order: 0,
-            bounds: quad.bounds.scale(scale_factor),
+            bounds,
             content_mask: content_mask.scale(scale_factor),
             background: quad.background.opacity(opacity),
             border_color: quad.border_color.opacity(opacity),
-            corner_radii: quad.corner_radii.scale(scale_factor),
-            border_widths: quad.border_widths.scale(scale_factor),
+            corner_radii: quad.corner_radii.scale(device_scale),
+            border_widths: quad.border_widths.scale(device_scale),
             border_style: quad.border_style,
         });
     }
@@ -2861,9 +3003,11 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let content_mask = self.content_mask();
         let opacity = self.element_opacity();
-        path.content_mask = content_mask;
+        if !self.element_transform.is_identity() {
+            path = path.transformed(&self.element_transform);
+        }
+        path.content_mask = self.window_content_mask();
         let color: Background = color.into();
         path.color = color.opacity(opacity);
         self.next_frame
@@ -2892,16 +3036,16 @@ impl Window {
             origin,
             size: size(width, height),
         };
-        let content_mask = self.content_mask();
+        let content_mask = self.window_content_mask();
         let element_opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(Underline {
             order: 0,
             pad: 0,
-            bounds: bounds.scale(scale_factor),
+            bounds: self.device_bounds(bounds),
             content_mask: content_mask.scale(scale_factor),
             color: style.color.unwrap_or_default().opacity(element_opacity),
-            thickness: style.thickness.scale(scale_factor),
+            thickness: style.thickness.scale(self.device_scale()),
             wavy: if style.wavy { 1 } else { 0 },
         });
     }
@@ -2923,15 +3067,15 @@ impl Window {
             origin,
             size: size(width, height),
         };
-        let content_mask = self.content_mask();
+        let content_mask = self.window_content_mask();
         let opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(Underline {
             order: 0,
             pad: 0,
-            bounds: bounds.scale(scale_factor),
+            bounds: self.device_bounds(bounds),
             content_mask: content_mask.scale(scale_factor),
-            thickness: style.thickness.scale(scale_factor),
+            thickness: style.thickness.scale(self.device_scale()),
             color: style.color.unwrap_or_default().opacity(opacity),
             wavy: 0,
         });
@@ -2956,8 +3100,10 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
-        let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
+        let window_scale_factor = self.scale_factor();
+        // Rasterized at the size it's drawn.
+        let scale_factor = self.device_scale();
+        let glyph_origin = self.element_transform.apply(origin).scale(window_scale_factor);
 
         let subpixel_variant = Point {
             x: (glyph_origin.x.0.fract() * SUBPIXEL_VARIANTS_X as f32).floor() as u8,
@@ -2985,7 +3131,7 @@ impl Window {
                 origin: glyph_origin.map(|px| px.floor()) + raster_bounds.origin.map(Into::into),
                 size: tile.bounds.size.map(Into::into),
             };
-            let content_mask = self.content_mask().scale(scale_factor);
+            let content_mask = self.window_content_mask().scale(window_scale_factor);
             self.next_frame.scene.insert_primitive(MonochromeSprite {
                 order: 0,
                 pad: 0,
@@ -3016,8 +3162,9 @@ impl Window {
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
-        let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
+        let window_scale_factor = self.scale_factor();
+        let scale_factor = self.device_scale();
+        let glyph_origin = self.element_transform.apply(origin).scale(window_scale_factor);
         let params = RenderGlyphParams {
             font_id,
             glyph_id,
@@ -3042,7 +3189,7 @@ impl Window {
                 origin: glyph_origin.map(|px| px.floor()) + raster_bounds.origin.map(Into::into),
                 size: tile.bounds.size.map(Into::into),
             };
-            let content_mask = self.content_mask().scale(scale_factor);
+            let content_mask = self.window_content_mask().scale(window_scale_factor);
             let opacity = self.element_opacity();
 
             self.next_frame.scene.insert_primitive(PolychromeSprite {
@@ -3075,7 +3222,7 @@ impl Window {
         let element_opacity = self.element_opacity();
         let scale_factor = self.scale_factor();
 
-        let bounds = bounds.scale(scale_factor);
+        let bounds = self.device_bounds(bounds);
         let params = RenderSvgParams {
             path,
             size: bounds.size.map(|pixels| {
@@ -3094,7 +3241,7 @@ impl Window {
         else {
             return Ok(());
         };
-        let content_mask = self.content_mask().scale(scale_factor);
+        let content_mask = self.window_content_mask().scale(scale_factor);
         let svg_bounds = Bounds {
             origin: bounds.center()
                 - Point::new(
@@ -3137,7 +3284,7 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let bounds = bounds.scale(scale_factor);
+        let bounds = self.device_bounds(bounds);
         let params = RenderImageParams {
             image_id: data.id,
             frame_index,
@@ -3155,8 +3302,8 @@ impl Window {
                 )))
             })?
             .expect("Callback above only returns Some");
-        let content_mask = self.content_mask().scale(scale_factor);
-        let corner_radii = corner_radii.scale(scale_factor);
+        let content_mask = self.window_content_mask().scale(scale_factor);
+        let corner_radii = corner_radii.scale(self.device_scale());
         let opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
@@ -3184,8 +3331,8 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let bounds = bounds.scale(scale_factor);
-        let content_mask = self.content_mask().scale(scale_factor);
+        let bounds = self.device_bounds(bounds);
+        let content_mask = self.window_content_mask().scale(scale_factor);
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
@@ -3313,6 +3460,7 @@ impl Window {
             bounds,
             content_mask,
             behavior,
+            transform: self.element_transform,
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
@@ -3424,10 +3572,16 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
+        // Listeners inside a zoomed subtree get positions in its units.
+        let transform = self.element_transform;
         self.next_frame.mouse_listeners.push(Some(Box::new(
             move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
-                if let Some(event) = event.downcast_ref() {
-                    handler(event, phase, window, cx)
+                if let Some(event) = event.downcast_ref::<Event>() {
+                    if transform.is_identity() {
+                        handler(event, phase, window, cx)
+                    } else {
+                        handler(&event.transformed(&transform), phase, window, cx)
+                    }
                 }
             },
         )));

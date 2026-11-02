@@ -22,7 +22,10 @@ gui = [
     "dep:objc2",
     "dep:objc2-app-kit",
     "dep:objc2-foundation",
+    "dep:objc2-web-kit",
     "dep:resvg",
+    "dep:image",
+    "dep:raw-window-handle",
 ]
 
 [dependencies]
@@ -33,9 +36,21 @@ futures = "0.3.34"
 # (Command Line Tools are enough). Drop it once Xcode is installed if you want
 # precompiled shaders.
 gpui = { version = "0.2.2", features = ["runtime_shaders"], optional = true }
-ignore = "=0.4.33"
+ignore = "=0.4.34"
+# A Browser window's snapshot (shown while something covers the page) as a
+# GPUI image. Already in gpui's dependency tree, like raw-window-handle,
+# which finds the native view a page goes next to.
+image = { version = "0.25.10", default-features = false, optional = true }
+raw-window-handle = { version = "0.6", optional = true }
 libc = "0.2.191"
 serde = { version = "1.0.229", features = ["derive"] }
+# SFTP windows (src/services/sftp.rs): SSH and SFTP in pure Rust, run by
+# the server on tokio. russh 0.52 is the last release whose crypto is all
+# RustCrypto (later ones need ring or aws-lc-rs, which need a C compiler to
+# cross-build the static Linux server).
+russh = { version = "=0.52.1", default-features = false }
+russh-sftp = "3.0.1"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "fs"] }
 serde_json = "1.0.154"
 # Noise for remote servers. Only the pure-Rust primitives it uses (no "std":
 # in snow 0.10 that pulls in ring, which needs a C compiler to cross-build).
@@ -54,7 +69,8 @@ portable-pty = "0.9.0"
 uds_windows = "1.2.1"
 
 # Native bits GPUI doesn't expose (see src/platform/macos.rs): trackpad
-# pinches and the Dock icon. All already in gpui's dependency tree.
+# pinches and the Dock icon, all already in gpui's dependency tree; and
+# WebKit for Browser windows.
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = { version = "0.6.2", optional = true }
 objc2 = { version = "0.6.5", optional = true }
@@ -75,8 +91,53 @@ objc2-app-kit = { version = "0.3.2", optional = true, default-features = false, 
     "NSStatusBarButton",
     "NSStatusItem",
     "NSView",
+    "NSWindow",
+    "NSBitmapImageRep",
+    "NSImageRep",
+    "NSGraphics",
+    "NSGraphicsContext",
+    # Dragging files out to other apps (src/platform/drag_out.rs).
+    "NSDragging",
+    "NSDraggingItem",
+    "NSDraggingSession",
+    "NSPasteboard",
+    "NSWorkspace",
 ] }
-objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSData", "NSGeometry", "NSString"] }
+objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSData",
+    "NSDictionary",
+    "NSError",
+    "NSGeometry",
+    "NSString",
+    "NSURL",
+    "NSURLRequest",
+    "NSValue",
+] }
+# Browser windows: WebKit's WKWebView (see src/platform/webview.rs).
+objc2-web-kit = { version = "0.3.2", optional = true, default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-app-kit",
+    "objc2-core-foundation",
+    "WKFindConfiguration",
+    "WKFindResult",
+    "WKFrameInfo",
+    "WKNavigation",
+    "WKNavigationAction",
+    "WKNavigationDelegate",
+    "WKPreferences",
+    "WKScriptMessage",
+    "WKScriptMessageHandler",
+    "WKSnapshotConfiguration",
+    "WKUIDelegate",
+    "WKUserContentController",
+    "WKUserScript",
+    "WKWebView",
+    "WKWebViewConfiguration",
+    "WKWindowFeatures",
+] }
 resvg = { version = "0.45.1", optional = true }
 
 # Unoptimized, gpui (layout, text, painting) and alacritty drop frames on a

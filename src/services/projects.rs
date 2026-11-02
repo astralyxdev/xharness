@@ -108,6 +108,10 @@ pub struct Project {
     /// The part of the canvas in view, so a project reopens where you left it.
     #[serde(default)]
     pub viewport: Viewport,
+    /// Text, notes and sections drawn on the canvas, back to front. They
+    /// aren't windows: the sidebar doesn't list them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub marks: Vec<Mark>,
 }
 
 fn loaded_by_default() -> bool {
@@ -161,6 +165,12 @@ pub enum ItemKind {
     /// The project's repository, like GitHub Desktop (see `windows/git.rs`).
     /// Every project with a folder has one.
     Git,
+    /// A web page, at the window's size or a device's (see
+    /// `windows/browser`).
+    Browser,
+    /// Files on other machines over SFTP, like FileZilla (see
+    /// `windows/sftp`).
+    Sftp,
 }
 
 impl ItemKind {
@@ -171,6 +181,8 @@ impl ItemKind {
             ItemKind::Lino => IconName::Activity,
             ItemKind::Editor => IconName::FileCode,
             ItemKind::Git => IconName::GitBranch,
+            ItemKind::Browser => IconName::Globe,
+            ItemKind::Sftp => IconName::Server,
         }
     }
 
@@ -181,6 +193,8 @@ impl ItemKind {
             ItemKind::Lino => "Lino",
             ItemKind::Editor => "Editor",
             ItemKind::Git => "Git",
+            ItemKind::Browser => "Browser",
+            ItemKind::Sftp => "SFTP",
         }
     }
 
@@ -192,12 +206,51 @@ impl ItemKind {
             ItemKind::Lino => (560., 600.),
             ItemKind::Editor => (760., 600.),
             ItemKind::Git => (1040., 640.),
+            // Room for a phone with margins, or a small laptop page.
+            ItemKind::Browser => (1000., 760.),
+            // Two lists side by side, and the transfers under them.
+            ItemKind::Sftp => (1080., 640.),
         }
     }
 
     /// The windows every project with a folder has, in this order at the
     /// top of its list (see [`Project::is_permanent`]).
     pub const BUILT_IN: [ItemKind; 3] = [ItemKind::Explorer, ItemKind::Lino, ItemKind::Git];
+}
+
+/// What a Browser window shows: its page, and the size it shows it at.
+/// Saved in `project.json`, as a dev server's address is worth sharing.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BrowserSettings {
+    /// The page, or empty for none yet.
+    pub url: String,
+    /// A device from the Browser's list (`windows/browser/devices.rs`), by
+    /// id; `None` follows the window's size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    /// The device turned on its side.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub landscape: bool,
+    /// The page's zoom in percent (`None`: 100%).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_zoom: Option<u16>,
+}
+
+/// Where an SFTP window is: its server (one of the app's, see
+/// `windows/sftp/sites.rs`) and the folder shown on each side. Saved per
+/// machine (state.json), like the servers.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SftpSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
+    /// The folder on the project's machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local: Option<PathBuf>,
+    /// The folder on the server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
 }
 
 /// How an Explorer window shows the folder. Saved per machine (state.json).
@@ -294,6 +347,12 @@ pub struct ProjectItem {
     /// The file an Editor window shows (absolute).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
+    /// What a Browser window shows (Browser windows only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<BrowserSettings>,
+    /// An SFTP window's server and folders (SFTP windows only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sftp: Option<SftpSettings>,
 }
 
 pub fn new_session_id() -> String {
@@ -337,6 +396,91 @@ impl Default for Viewport {
             zoom: 1.,
         }
     }
+}
+
+/// What a mark on a canvas is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MarkKind {
+    /// Bare text, as a label or a heading.
+    Text,
+    /// A sticky note: text on a colored card. Lines starting `[ ]` or `[x]`
+    /// are checkboxes.
+    Note,
+    /// A named area behind the windows, to group them. Moving it moves what's
+    /// inside it.
+    Section,
+}
+
+impl MarkKind {
+    /// Size when added; a Text mark's height follows its text.
+    pub fn default_size(self) -> (f32, f32) {
+        match self {
+            MarkKind::Text => (280., 40.),
+            MarkKind::Note => (240., 200.),
+            MarkKind::Section => (1200., 760.),
+        }
+    }
+
+    pub fn min_size(self) -> (f32, f32) {
+        match self {
+            MarkKind::Text => (60., 24.),
+            MarkKind::Note => (140., 100.),
+            MarkKind::Section => (240., 160.),
+        }
+    }
+
+    /// Sections sit behind the windows; text and notes in front of them.
+    pub fn behind_windows(self) -> bool {
+        self == MarkKind::Section
+    }
+}
+
+/// Text sizes for Text marks, in canvas units.
+pub const TEXT_SIZES: [f32; 4] = [14., 20., 32., 48.];
+
+fn default_text_size() -> f32 {
+    TEXT_SIZES[1]
+}
+
+fn is_default_text_size(size: &f32) -> bool {
+    *size == default_text_size()
+}
+
+/// Something drawn on a canvas to mark it up (see [`MarkKind`]), in canvas
+/// units like a window's [`Frame`]. Saved in `project.json`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Mark {
+    pub id: u64,
+    pub kind: MarkKind,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    /// The text; a section's name.
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub color: ProjectColor,
+    /// A Text mark's font size.
+    #[serde(default = "default_text_size", skip_serializing_if = "is_default_text_size")]
+    pub text_size: f32,
+}
+
+impl Mark {
+    pub fn contains(&self, x: f32, y: f32, width: f32, height: f32) -> bool {
+        x >= self.x && y >= self.y && x + width <= self.x + self.width && y + height <= self.y + self.height
+    }
+}
+
+/// A change to a mark (see [`ProjectStore::update_mark`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum MarkChange {
+    Text(String),
+    Color(ProjectColor),
+    TextSize(f32),
+    /// Position and size.
+    Bounds { x: f32, y: f32, width: f32, height: f32 },
 }
 
 /// Size of a newly opened window: about 80 × 20 terminal cells.
@@ -410,6 +554,8 @@ struct RegistryEntry<'a> {
     windows: Option<&'a [Frame]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     viewport: Option<&'a Viewport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    marks: Option<&'a [Mark]>,
 }
 
 /// `.xharness/project.json`.
@@ -421,6 +567,8 @@ struct ProjectFile {
     color: ProjectColor,
     #[serde(default)]
     windows: Vec<WindowEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    marks: Vec<Mark>,
 }
 
 /// A window in `project.json`; `frame` is `None` while it's closed.
@@ -435,6 +583,9 @@ struct WindowEntry {
     /// it (so the layout travels with the folder), else absolute.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     path: Option<PathBuf>,
+    /// A Browser's page and size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    browser: Option<BrowserSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     frame: Option<FrameEntry>,
 }
@@ -468,6 +619,8 @@ struct WindowState {
     cwd: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     explorer: Option<ExplorerSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sftp: Option<SftpSettings>,
 }
 
 /// What a folder's `.xharness` says, for offering to open it.
@@ -516,6 +669,7 @@ fn load_from_folder(project: &mut Project, folder: &Path) -> io::Result<bool> {
     project.viewport = state.viewport;
     project.items.clear();
     project.windows.clear();
+    project.marks = file.marks;
     let mut frames = Vec::new();
     for window in file.windows {
         let local = state.windows.get(&window.id.to_string());
@@ -530,6 +684,12 @@ fn load_from_folder(project: &mut Project, folder: &Path) -> io::Result<bool> {
                 .and_then(|s| s.explorer.clone())
                 .or_else(|| (window.kind == ItemKind::Explorer).then(ExplorerSettings::default)),
             path: window.path.map(|path| folder.join(path)),
+            browser: window
+                .browser
+                .or_else(|| (window.kind == ItemKind::Browser).then(BrowserSettings::default)),
+            sftp: local
+                .and_then(|s| s.sftp.clone())
+                .or_else(|| (window.kind == ItemKind::Sftp).then(SftpSettings::default)),
         });
         if let Some(frame) = window.frame {
             frames.push((
@@ -565,6 +725,7 @@ fn folder_files(project: &Project) -> io::Result<(Vec<u8>, Vec<u8>)> {
                 Some(folder) => path.strip_prefix(folder).unwrap_or(path).to_path_buf(),
                 None => path.clone(),
             }),
+            browser: item.browser.clone(),
             frame: project
                 .windows
                 .iter()
@@ -587,6 +748,7 @@ fn folder_files(project: &Project) -> io::Result<(Vec<u8>, Vec<u8>)> {
         icon: project.icon,
         color: project.color,
         windows,
+        marks: project.marks.clone(),
     };
     let state = StateFile {
         version: FILE_VERSION,
@@ -601,6 +763,7 @@ fn folder_files(project: &Project) -> io::Result<(Vec<u8>, Vec<u8>)> {
                         session: item.session.clone(),
                         cwd: item.cwd.clone(),
                         explorer: item.explorer.clone(),
+                        sftp: item.sftp.clone(),
                     },
                 )
             })
@@ -749,6 +912,8 @@ impl ProjectStore {
                                 cwd: None,
                                 explorer: (kind == ItemKind::Explorer).then(ExplorerSettings::default),
                                 path: None,
+                                browser: None,
+                                sftp: None,
                             },
                         );
                     }
@@ -823,6 +988,7 @@ impl ProjectStore {
             items: Vec::new(),
             windows: Vec::new(),
             viewport: Viewport::default(),
+            marks: Vec::new(),
         };
         let server = project.server();
         if let Some(folder) = &folder
@@ -929,6 +1095,8 @@ impl ProjectStore {
             cwd: None,
             explorer: (kind == ItemKind::Explorer).then(ExplorerSettings::default),
             path: None,
+            browser: (kind == ItemKind::Browser).then(BrowserSettings::default),
+            sftp: (kind == ItemKind::Sftp).then(SftpSettings::default),
         });
         place(project, id, placement);
         self.save();
@@ -974,6 +1142,8 @@ impl ProjectStore {
             cwd: None,
             explorer: None,
             path: Some(path),
+            browser: None,
+            sftp: None,
         });
         place(project, id, placement);
         self.save();
@@ -1013,6 +1183,42 @@ impl ProjectStore {
                 item.color = color;
             }
         });
+    }
+
+    /// Adds a Browser window showing `settings` and opens it.
+    pub fn add_browser(&mut self, project: u64, settings: BrowserSettings, placement: Placement) -> Option<u64> {
+        let id = self.add_item(project, ItemKind::Browser, placement)?;
+        if let Some(item) = self.item_mut(project, id) {
+            item.browser = Some(settings);
+        }
+        self.save();
+        Some(id)
+    }
+
+    /// Adds an SFTP window and opens it.
+    pub fn add_sftp(&mut self, project: u64, settings: SftpSettings, placement: Placement) -> Option<u64> {
+        let id = self.add_item(project, ItemKind::Sftp, placement)?;
+        if let Some(item) = self.item_mut(project, id) {
+            item.sftp = Some(settings);
+        }
+        self.save();
+        Some(id)
+    }
+
+    /// Replaces an SFTP window's server and folders. Doesn't save (you go
+    /// from folder to folder in quick succession).
+    pub fn set_sftp_settings(&mut self, project: u64, item: u64, settings: SftpSettings) {
+        if let Some(item) = self.item_mut(project, item) {
+            item.sftp = Some(settings);
+        }
+    }
+
+    /// Replaces a Browser window's page and size. Doesn't save (pages
+    /// change address as you click around).
+    pub fn set_browser_settings(&mut self, project: u64, item: u64, settings: BrowserSettings) {
+        if let Some(item) = self.item_mut(project, item) {
+            item.browser = Some(settings);
+        }
     }
 
     /// Replaces an Explorer window's view settings. Doesn't save (sorting
@@ -1078,6 +1284,128 @@ impl ProjectStore {
         }
     }
 
+    // Marks ------------------------------------------------------------------
+
+    /// Adds a mark with its top-left corner at `x`, `y`. Returns its id.
+    pub fn add_mark(&mut self, project: u64, kind: MarkKind, x: f32, y: f32, text: String) -> Option<u64> {
+        self.get(project)?;
+        let id = self.take_id();
+        let (width, height) = kind.default_size();
+        let project = self.project_mut(project)?;
+        let mark = Mark {
+            id,
+            kind,
+            x,
+            y,
+            width,
+            height,
+            text,
+            color: match kind {
+                MarkKind::Note => ProjectColor::Amber,
+                MarkKind::Section => ProjectColor::Blue,
+                MarkKind::Text => ProjectColor::Gray,
+            },
+            text_size: default_text_size(),
+        };
+        // Sections go behind the marks already there; the rest in front.
+        if kind.behind_windows() {
+            project.marks.insert(0, mark);
+        } else {
+            project.marks.push(mark);
+        }
+        self.save();
+        Some(id)
+    }
+
+    /// Adds a copy of `mark`, offset a little. Returns its id.
+    pub fn duplicate_mark(&mut self, project: u64, mark: u64) -> Option<u64> {
+        let original = self.get(project)?.marks.iter().find(|m| m.id == mark)?.clone();
+        let id = self.take_id();
+        let project = self.project_mut(project)?;
+        let at = project.marks.iter().position(|m| m.id == mark).map_or(project.marks.len(), |i| i + 1);
+        project.marks.insert(
+            at,
+            Mark {
+                id,
+                x: original.x + WINDOW_GAP,
+                y: original.y + WINDOW_GAP,
+                ..original
+            },
+        );
+        self.save();
+        Some(id)
+    }
+
+    /// Changes a mark. Moving and resizing don't save (they happen on every
+    /// mouse move of a drag); the rest does.
+    pub fn update_mark(&mut self, project: u64, mark: u64, change: MarkChange) {
+        let Some(found) = self.project_mut(project).and_then(|p| p.marks.iter_mut().find(|m| m.id == mark)) else {
+            return;
+        };
+        let save = !matches!(change, MarkChange::Bounds { .. });
+        match change {
+            MarkChange::Text(text) => found.text = text,
+            MarkChange::Color(color) => found.color = color,
+            MarkChange::TextSize(size) => found.text_size = size,
+            MarkChange::Bounds { x, y, width, height } => {
+                let (min_w, min_h) = found.kind.min_size();
+                found.x = x;
+                found.y = y;
+                found.width = width.max(min_w);
+                found.height = height.max(min_h);
+            }
+        }
+        if save {
+            self.save();
+        }
+    }
+
+    pub fn remove_mark(&mut self, project: u64, mark: u64) {
+        self.modify(project, |project| project.marks.retain(|m| m.id != mark));
+    }
+
+    /// Puts a mark in front of the others of its layer. Doesn't save.
+    pub fn raise_mark(&mut self, project: u64, mark: u64) -> bool {
+        let Some(project) = self.project_mut(project) else {
+            return false;
+        };
+        let Some(index) = project.marks.iter().position(|m| m.id == mark) else {
+            return false;
+        };
+        if index + 1 == project.marks.len() {
+            return false;
+        }
+        let mark = project.marks.remove(index);
+        project.marks.push(mark);
+        true
+    }
+
+    /// Moves windows and marks by `dx`, `dy` (moving a section and what's in
+    /// it). Doesn't save.
+    pub fn move_together(&mut self, project: u64, windows: &[(u64, f32, f32)], marks: &[(u64, f32, f32)], dx: f32, dy: f32) {
+        let Some(project) = self.project_mut(project) else {
+            return;
+        };
+        for (item, x, y) in windows {
+            if let Some(frame) = project.windows.iter_mut().find(|f| f.item == *item) {
+                frame.x = x + dx;
+                frame.y = y + dy;
+            }
+        }
+        for (id, x, y) in marks {
+            if let Some(mark) = project.marks.iter_mut().find(|m| m.id == *id) {
+                mark.x = x + dx;
+                mark.y = y + dy;
+            }
+        }
+    }
+
+    /// Lines the open windows up in rows, left to right, roughly as wide as
+    /// they are tall overall, in their current reading order. Saves.
+    pub fn tidy_windows(&mut self, project: u64) {
+        self.modify(project, |project| tidy(&mut project.windows));
+    }
+
     // Internals --------------------------------------------------------------
 
     fn take_id(&mut self) -> u64 {
@@ -1134,6 +1462,7 @@ impl ProjectStore {
                         items: inline.then_some(p.items.as_slice()),
                         windows: inline.then_some(p.windows.as_slice()),
                         viewport: inline.then_some(&p.viewport),
+                        marks: (inline && !p.marks.is_empty()).then_some(p.marks.as_slice()),
                     }
                 })
                 .collect(),
@@ -1238,6 +1567,38 @@ fn place(project: &mut Project, item: u64, placement: Placement) {
         }
     }
     project.windows.push(frame);
+}
+
+/// Rows of windows in reading order (top to bottom, then left to right),
+/// starting where the top-left one is, each row about as wide as the square
+/// root of the total area suggests.
+fn tidy(windows: &mut [Frame]) {
+    if windows.is_empty() {
+        return;
+    }
+    let left = windows.iter().map(|f| f.x).fold(f32::INFINITY, f32::min);
+    let top = windows.iter().map(|f| f.y).fold(f32::INFINITY, f32::min);
+    let area: f32 = windows.iter().map(|f| (f.width + WINDOW_GAP) * (f.height + WINDOW_GAP)).sum();
+    let widest = windows.iter().map(|f| f.width).fold(0., f32::max);
+    let row_width = (area.sqrt() * 1.4).max(widest);
+    let mut order: Vec<usize> = (0..windows.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (a, b) = (&windows[a], &windows[b]);
+        (a.y, a.x).partial_cmp(&(b.y, b.x)).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let (mut x, mut y, mut row_height) = (left, top, 0f32);
+    for index in order {
+        let frame = &mut windows[index];
+        if x > left && x + frame.width > left + row_width {
+            x = left;
+            y += row_height + WINDOW_GAP;
+            row_height = 0.;
+        }
+        frame.x = x;
+        frame.y = y;
+        x += frame.width + WINDOW_GAP;
+        row_height = row_height.max(frame.height);
+    }
 }
 
 fn right_of_everything(project: &Project) -> (f32, f32) {
@@ -1428,6 +1789,24 @@ mod tests {
 
         let reloaded = store_in(&dir);
         assert_eq!(reloaded.get(1).unwrap(), &before, "windows, order, sessions, folders");
+    }
+
+    /// A Browser's page and device are part of the shared layout.
+    #[test]
+    fn browsers_keep_their_page_and_device() {
+        let (mut store, dir) = canvas_store("browser");
+        let settings = BrowserSettings {
+            url: "http://localhost:5173/".into(),
+            device: Some("iphone-16-pro".into()),
+            landscape: true,
+            page_zoom: Some(125),
+        };
+        let id = store.add_browser(1, settings.clone(), Placement::At { x: 0., y: 0. }).unwrap();
+        let reloaded = store_in(&dir);
+        let item = reloaded.get(1).unwrap().item(id).unwrap();
+        assert_eq!((item.kind, item.browser.as_ref()), (ItemKind::Browser, Some(&settings)));
+        let shared = fs::read_to_string(dir.join("project").join(PROJECT_DIR).join(PROJECT_FILE)).unwrap();
+        assert!(shared.contains("localhost:5173") && shared.contains("iphone-16-pro"), "{shared}");
     }
 
     #[test]

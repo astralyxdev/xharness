@@ -11,9 +11,9 @@
 //! Over the window you're working in, scrolling scrolls its terminal; over
 //! anything else it pans.
 //!
-//! Zoom scales windows the way Figma does: the canvas renders each window's
-//! contents at a scaled rem size (see [`Scaled`]), so text stays sharp and a
-//! terminal keeps its rows and columns at every zoom level.
+//! Zoom only changes the view, the way Figma's does: each window is laid out
+//! at 100% and drawn scaled (see [`Zoomed`]), so nothing inside it moves,
+//! wraps or resizes with the zoom, and text is still drawn sharp.
 //!
 //! Positions live in the [`ProjectStore`] in canvas units (1 unit = 1px at
 //! 100%). The canvas owns the live terminal sessions of the open windows.
@@ -28,21 +28,30 @@ use gpui::{
 };
 
 mod geometry;
+mod marks;
 mod scaled;
 
-pub use geometry::{Edge, fit, resized, zoom_around};
-use scaled::Scaled;
+pub use marks::Tool;
+use marks::{DrawSection, MarkEditing, MarkGesture, MoveMark, ResizeMark};
 
+pub use geometry::{Edge, fit, resized, resized_to_min, zoom_around};
+use scaled::Zoomed;
+
+use crate::app::settings::{self, Settings};
+use crate::i18n::t;
 use crate::services::projects::{
-    DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH, ExplorerSettings, Frame, ItemKind, Placement, Project, ProjectItem,
-    ProjectStore, Viewport,
+    MarkKind,
+    BrowserSettings, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH, ExplorerSettings, Frame, ItemKind, Placement, Project, ProjectItem,
+    ProjectStore, SftpSettings, Viewport,
 };
 use crate::services::server::HostAddress;
 use crate::ui::assets::IconName;
-use crate::ui::context_menu::MenuEntry;
+use crate::ui::context_menu::{MenuAt, MenuEntry};
+use crate::windows::browser::{BrowserEvent, BrowserView, layers};
 use crate::windows::editor::{EditorEvent, EditorView};
 use crate::windows::explorer::{DraggedFiles, ExplorerEvent, ExplorerView};
 use crate::windows::git::{GitEvent, GitView};
+use crate::windows::sftp::{SftpEvent, SftpView};
 use crate::windows::lino::LinoView;
 use crate::windows::Mods;
 use crate::windows::terminal::{SessionSpec, TerminalEvent, TerminalView};
@@ -60,10 +69,19 @@ actions!(
         ZoomToActualSize,
         ZoomToFit,
         ZoomToWindow,
+        SelectTool,
+        HandTool,
+        TextTool,
+        NoteTool,
+        SectionTool,
+        DeleteSelection,
+        Deselect,
     ]
 );
 
 const KEY_CONTEXT: &str = "ProjectCanvas";
+/// A window's header (`h_8`), at 100%.
+const HEADER_HEIGHT: f32 = 32.;
 /// Each zoom step in or out.
 const ZOOM_STEP: f32 = 1.25;
 /// Live changes (drags, panning) are written this long after they stop.
@@ -80,18 +98,32 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-0", ZoomToActualSize, context),
         KeyBinding::new("secondary-1", ZoomToFit, context),
         KeyBinding::new("secondary-2", ZoomToWindow, context),
+        // These only act on the canvas itself (no window active); in a
+        // window they type as usual (see `on_canvas`).
+        KeyBinding::new("v", SelectTool, context),
+        KeyBinding::new("h", HandTool, context),
+        KeyBinding::new("t", TextTool, context),
+        KeyBinding::new("n", NoteTool, context),
+        KeyBinding::new("s", SectionTool, context),
+        KeyBinding::new("backspace", DeleteSelection, context),
+        KeyBinding::new("delete", DeleteSelection, context),
+        KeyBinding::new("escape", Deselect, context),
     ]);
+    marks::bind_keys(cx);
 }
 
 /// What the canvas asks of the app shell, which owns menus.
 pub enum CanvasEvent {
-    /// A window's own menu (its header's ⋯).
-    ItemMenu { item: u64, position: Point<Pixels> },
+    /// A window's own menu (its header's ⋯), at the pointer.
+    /// A window's menu: under its header's … button (`at`), or at the
+    /// pointer (`None`, a right-click).
+    ItemMenu { item: u64, at: Option<MenuAt> },
     /// A menu a window built (e.g. the Explorer's View menu).
     Menu {
         item: u64,
         entries: Vec<MenuEntry>,
-        position: Point<Pixels>,
+        /// In the app window's coordinates (see [`ProjectCanvas::on_screen`]).
+        position: MenuAt,
     },
     /// Open a terminal in `folder`, next to window `next_to`.
     OpenTerminal { folder: PathBuf, next_to: u64 },
@@ -101,6 +133,8 @@ pub enum CanvasEvent {
     OpenFileAt { path: PathBuf, line: usize, character: usize, next_to: u64 },
     /// Open the folder `root` in a new explorer, next to window `next_to`.
     OpenExplorer { root: PathBuf, next_to: u64 },
+    /// The toolbar's "New window" menu, over its button.
+    NewWindowMenu(MenuAt),
     /// An editor with unsaved changes is closing: ask first, then call
     /// [`ProjectCanvas::discard_item`].
     ConfirmDiscard { item: u64, name: String },
@@ -121,16 +155,20 @@ enum Content {
     Lino(Entity<LinoView>),
     Editor(Entity<EditorView>),
     Git(Entity<GitView>),
+    Browser(Entity<BrowserView>),
+    Sftp(Entity<SftpView>),
 }
 
 impl Content {
     fn view(&self) -> AnyView {
         match self {
+            Content::Browser(browser) => browser.clone().into(),
             Content::Terminal(terminal) => terminal.clone().into(),
             Content::Explorer(explorer) => explorer.clone().into(),
             Content::Lino(lino) => lino.clone().into(),
             Content::Editor(editor) => editor.clone().into(),
             Content::Git(git) => git.clone().into(),
+            Content::Sftp(sftp) => sftp.clone().into(),
         }
     }
 
@@ -141,6 +179,8 @@ impl Content {
             Content::Lino(lino) => lino.read(cx).focus(window),
             Content::Editor(editor) => editor.read(cx).focus(window),
             Content::Git(git) => git.read(cx).focus(window),
+            Content::Browser(browser) => browser.read(cx).focus(window, cx),
+            Content::Sftp(sftp) => sftp.read(cx).focus(window),
         }
     }
 
@@ -151,6 +191,8 @@ impl Content {
             Content::Lino(lino) => lino.read(cx).contains_focus(window, cx),
             Content::Editor(editor) => editor.read(cx).contains_focus(window, cx),
             Content::Git(git) => git.read(cx).contains_focus(window, cx),
+            Content::Browser(browser) => browser.read(cx).contains_focus(window, cx),
+            Content::Sftp(sftp) => sftp.read(cx).contains_focus(window, cx),
         }
     }
 
@@ -160,6 +202,32 @@ impl Content {
             terminal.read(cx).kill();
         }
     }
+}
+
+/// A canvas at a glance, for the footer.
+pub struct CanvasStats {
+    pub windows: usize,
+    pub terminals: usize,
+    /// Terminals running a command.
+    pub running: usize,
+    pub marks: usize,
+    pub zoom: f32,
+    pub active: Option<(ItemKind, String)>,
+}
+
+/// What the command palette asks a canvas to do (see [`ProjectCanvas::run`]).
+#[derive(Clone, Copy, Debug)]
+pub enum CanvasCommand {
+    ZoomIn,
+    ZoomOut,
+    ZoomToActualSize,
+    ZoomToFit,
+    ZoomToWindow,
+    Tidy,
+    AddMark(MarkKind),
+    Tool(Tool),
+    CloseWindow,
+    NewTerminalBelow,
 }
 
 /// Dragging a window by its header.
@@ -192,6 +260,8 @@ struct Gesture {
 }
 
 pub struct ProjectCanvas {
+    /// Where its toolbar's dropdown buttons are (see [`ui::Anchors`]).
+    anchors: ui::Anchors,
     project_id: u64,
     /// The server the project's windows work on (`None`: this machine's).
     server: Option<HostAddress>,
@@ -206,7 +276,17 @@ pub struct ProjectCanvas {
     bounds: Rc<Cell<Bounds<Pixels>>>,
     gesture: Option<Gesture>,
     save_task: Option<Task<()>>,
+    /// What a click on empty canvas does.
+    tool: Tool,
+    /// The mark that's picked (its toolbar shows).
+    selected_mark: Option<u64>,
+    /// The mark whose text is being edited.
+    editing: Option<MarkEditing>,
+    mark_gesture: Option<MarkGesture>,
+    /// A section being drawn: where the drag started and where it is.
+    drawing: Option<(Point<Pixels>, Point<Pixels>)>,
     _store_subscription: Subscription,
+    _settings_subscription: Subscription,
 }
 
 impl EventEmitter<CanvasEvent> for ProjectCanvas {}
@@ -222,6 +302,8 @@ impl ProjectCanvas {
         // Windows opened or closed from elsewhere (the sidebar) start or stop
         // their sessions here.
         let subscription = cx.observe(&store, |this, _, cx| this.sync(cx));
+        // The dot grid and snapping are settings.
+        let settings_subscription = cx.observe_global::<Settings>(|_, cx| cx.notify());
         let server = store.read(cx).get(project_id).and_then(Project::server);
         let mut this = Self {
             project_id,
@@ -233,7 +315,14 @@ impl ProjectCanvas {
             bounds: Rc::new(Cell::new(Bounds::default())),
             gesture: None,
             save_task: None,
+            anchors: ui::Anchors::default(),
+            tool: Tool::Select,
+            selected_mark: None,
+            editing: None,
+            mark_gesture: None,
+            drawing: None,
             _store_subscription: subscription,
+            _settings_subscription: settings_subscription,
         };
         this.sync(cx);
         this.close_uninstalled(cx);
@@ -353,11 +442,14 @@ impl ProjectCanvas {
                             root: root.clone(),
                             next_to: id,
                         }),
-                        ExplorerEvent::Menu { entries, position } => cx.emit(CanvasEvent::Menu {
+                        ExplorerEvent::Menu { entries, position } => {
+                            let position = this.menu_on_screen(id, *position, cx);
+                            cx.emit(CanvasEvent::Menu {
                             item: id,
                             entries: entries.clone(),
-                            position: *position,
-                        }),
+                            position,
+                        })
+                        }
                     });
                     self.windows.insert(id, (Content::Explorer(explorer), vec![subscription]));
                 }
@@ -394,12 +486,15 @@ impl ProjectCanvas {
                         continue;
                     };
                     let git = cx.new(|cx| GitView::new(root, server.clone(), cx));
-                    let subscription = cx.subscribe(&git, move |_, _, event, cx| match event {
-                        GitEvent::Menu { entries, position } => cx.emit(CanvasEvent::Menu {
+                    let subscription = cx.subscribe(&git, move |this, _, event, cx| match event {
+                        GitEvent::Menu { entries, position } => {
+                            let position = this.menu_on_screen(id, *position, cx);
+                            cx.emit(CanvasEvent::Menu {
                             item: id,
                             entries: entries.clone(),
-                            position: *position,
-                        }),
+                            position,
+                        })
+                        }
                         GitEvent::OpenFile(path) => cx.emit(CanvasEvent::OpenFile {
                             path: path.clone(),
                             next_to: id,
@@ -417,6 +512,69 @@ impl ProjectCanvas {
                         }),
                     });
                     self.windows.insert(id, (Content::Git(git), vec![subscription]));
+                }
+                ItemKind::Browser => {
+                    let settings = item.browser.clone().unwrap_or_default();
+                    let browser = cx.new(|cx| BrowserView::new(settings, cx));
+                    let subscriptions = vec![
+                        // Its header shows the page's title, and whether it's loading.
+                        cx.observe(&browser, |_, _, cx| cx.notify()),
+                        cx.subscribe(&browser, move |this, _, event, cx| match event {
+                            // The page took the click (it's a native view):
+                            // this is the window you're working in now.
+                            BrowserEvent::Activated => this.mark_active(id, cx),
+                            BrowserEvent::Changed(settings) => {
+                                let (project, settings) = (this.project_id, settings.clone());
+                                this.store
+                                    .update(cx, |store, _| store.set_browser_settings(project, id, settings));
+                                this.save_soon(cx);
+                            }
+                            BrowserEvent::Menu { entries, position } => {
+                            let position = this.menu_on_screen(id, *position, cx);
+                            cx.emit(CanvasEvent::Menu {
+                                item: id,
+                                entries: entries.clone(),
+                            position,
+                        })
+                        }
+                        }),
+                    ];
+                    self.windows.insert(id, (Content::Browser(browser), subscriptions));
+                }
+                ItemKind::Sftp => {
+                    let settings = item.sftp.clone().unwrap_or_default();
+                    let sftp = cx.new(|cx| SftpView::new(settings, folder.clone(), server.clone(), cx));
+                    let subscriptions = vec![
+                        // Its header shows where it's connected, and transfers running.
+                        cx.observe(&sftp, |_, _, cx| cx.notify()),
+                        cx.subscribe(&sftp, move |this, _, event, cx| match event {
+                            SftpEvent::Changed(settings) => {
+                                let (project, settings) = (this.project_id, settings.clone());
+                                this.store.update(cx, |store, _| store.set_sftp_settings(project, id, settings));
+                                this.save_soon(cx);
+                            }
+                            SftpEvent::Menu { entries, position } => {
+                                let position = this.menu_on_screen(id, *position, cx);
+                                cx.emit(CanvasEvent::Menu {
+                                    item: id,
+                                    entries: entries.clone(),
+                                    position,
+                                })
+                            }
+                            SftpEvent::Confirm {
+                                title,
+                                description,
+                                confirm,
+                                action,
+                            } => cx.emit(CanvasEvent::Confirm {
+                                title: title.clone(),
+                                description: description.clone(),
+                                confirm: confirm.clone(),
+                                action: action.clone(),
+                            }),
+                        }),
+                    ];
+                    self.windows.insert(id, (Content::Sftp(sftp), subscriptions));
                 }
             }
         }
@@ -477,6 +635,71 @@ impl ProjectCanvas {
         let project = self.project_id;
         let id = self.store.update(cx, |store, cx| {
             let id = store.add_item(project, ItemKind::Terminal, placement);
+            cx.notify();
+            id
+        });
+        if let Some(id) = id {
+            self.sync(cx);
+            self.focus_item(id, window, cx);
+        }
+    }
+
+    /// Opens a new window of `kind` with its top-left corner at (`x`, `y`).
+    pub fn add_window_at(&mut self, kind: ItemKind, x: f32, y: f32, window: &mut Window, cx: &mut Context<Self>) {
+        if !Mods::installed(kind, cx) {
+            return;
+        }
+        let project = self.project_id;
+        let placement = Placement::At {
+            x: settings::snap(x, cx),
+            y: settings::snap(y, cx),
+        };
+        let id = self.store.update(cx, |store, cx| {
+            let id = store.add_item(project, kind, placement);
+            cx.notify();
+            id
+        });
+        if let Some(id) = id {
+            self.sync(cx);
+            self.focus_item(id, window, cx);
+        }
+    }
+
+    /// Opens a new SFTP window next to `next_to` (or the active window), or
+    /// in the middle of the view.
+    pub fn add_sftp(&mut self, settings: SftpSettings, next_to: Option<u64>, window: &mut Window, cx: &mut Context<Self>) {
+        if !Mods::installed(ItemKind::Sftp, cx) {
+            return;
+        }
+        let placement = match next_to.or(self.active) {
+            Some(id) => Placement::RightOf(id),
+            None => self.centered_placement(cx),
+        };
+        let project = self.project_id;
+        let id = self.store.update(cx, |store, cx| {
+            let id = store.add_sftp(project, settings, placement);
+            cx.notify();
+            id
+        });
+        if let Some(id) = id {
+            self.sync(cx);
+            self.focus_item(id, window, cx);
+        }
+    }
+
+    /// Opens a new Browser window next to the active window, or in the
+    /// middle of the view, showing `settings`.
+    pub fn add_browser(&mut self, settings: BrowserSettings, next_to: Option<u64>, window: &mut Window, cx: &mut Context<Self>) {
+        if !Mods::installed(ItemKind::Browser, cx) {
+            return;
+        }
+        let placement = match next_to.or(self.active) {
+            Some(id) => Placement::RightOf(id),
+            None => self.centered_placement(cx),
+        };
+        let project = self.project_id;
+        let id = self.store.update(cx, |store, cx| {
+            let id = store.add_browser(project, settings, placement);
             cx.notify();
             id
         });
@@ -630,6 +853,33 @@ impl ProjectCanvas {
         }
     }
 
+    /// Files dropped on window `id`: a terminal goes to their folder (see
+    /// [`TerminalView::cd_into`]), a browser shows the first one, anything
+    /// else opens them next to it.
+    fn drop_on_window(&mut self, id: u64, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        match self.windows.get(&id).map(|(content, _)| content.clone()) {
+            Some(Content::Terminal(terminal)) => {
+                let Some(path) = paths.into_iter().next() else { return };
+                // A remote project's files aren't here to look at (as in
+                // `open_paths`): a name without an extension is a folder.
+                let is_dir = if self.server.is_some() { path.extension().is_none() } else { path.is_dir() };
+                let folder = if is_dir { Some(path) } else { path.parent().map(PathBuf::from) };
+                if let Some(folder) = folder {
+                    terminal.update(cx, |terminal, cx| terminal.cd_into(folder, cx));
+                    self.activate(id, window, cx);
+                }
+            }
+            Some(Content::Browser(browser)) if self.server.is_none() => {
+                if let Some(path) = paths.first() {
+                    let address = path.to_string_lossy().into_owned();
+                    browser.update(cx, |browser, cx| browser.open(&address, window, cx));
+                    self.activate(id, window, cx);
+                }
+            }
+            _ => self.open_paths(paths, Some(id), window, cx),
+        }
+    }
+
     /// Opens `path` in an editor and puts the caret at `line`/`character`.
     pub fn open_file_at(&mut self, path: PathBuf, line: usize, character: usize, next_to: u64, window: &mut Window, cx: &mut Context<Self>) {
         self.open_file(path, next_to, window, cx);
@@ -699,8 +949,21 @@ impl ProjectCanvas {
         self.reveal(id, cx);
     }
 
+    /// Makes `id` the active window and brings it to the front, leaving
+    /// the keyboard where it is (a Browser's page took it already).
+    fn mark_active(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.active = Some(id);
+        let project = self.project_id;
+        if self.store.update(cx, |store, _| store.raise(project, id)) {
+            self.save_soon(cx);
+        }
+        cx.notify();
+    }
+
     /// Makes `id` the active window: in front, with the keyboard.
     fn activate(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_editing(cx);
+        self.selected_mark = None;
         self.active = Some(id);
         let project = self.project_id;
         if self.store.update(cx, |store, _| store.raise(project, id)) {
@@ -804,8 +1067,8 @@ impl ProjectCanvas {
         self.sync(cx);
     }
 
-    /// Opens a copy of a terminal (a new shell in its folder) or an
-    /// explorer, to its right.
+    /// Opens a copy of a terminal (a new shell in its folder), an explorer
+    /// or a browser, to its right.
     pub fn duplicate_item(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = self.project(cx).and_then(|p| p.item(id)).cloned() else {
             return;
@@ -825,6 +1088,13 @@ impl ProjectCanvas {
                 }
             }
             ItemKind::Explorer => self.duplicate_explorer(id, window, cx),
+            ItemKind::Browser => {
+                let settings = match self.windows.get(&id) {
+                    Some((Content::Browser(browser), _)) => browser.read(cx).settings().clone(),
+                    _ => item.browser.unwrap_or_default(),
+                };
+                self.add_browser(settings, Some(id), window, cx);
+            }
             _ => {}
         }
     }
@@ -883,13 +1153,24 @@ impl ProjectCanvas {
             return;
         };
         let (dx, dy) = Self::travel(&gesture, mouse);
+        let snap = |value| settings::snap(value, cx);
         let next = match edge {
             None => Frame {
-                x: start.x + dx,
-                y: start.y + dy,
+                x: snap(start.x + dx),
+                y: snap(start.y + dy),
                 ..start
             },
-            Some(edge) => resized(start, edge, dx, dy),
+            Some(edge) => {
+                let next = resized(start, edge, dx, dy);
+                let (x, y) = (snap(next.x), snap(next.y));
+                Frame {
+                    x,
+                    y,
+                    width: snap(next.x + next.width) - x,
+                    height: snap(next.y + next.height) - y,
+                    ..next
+                }
+            }
         };
         let project = self.project_id;
         self.store.update(cx, |store, _| {
@@ -1000,6 +1281,141 @@ impl ProjectCanvas {
         }
     }
 
+    // Tools and marks -----------------------------------------------------------
+
+    /// Runs `f` when the canvas itself has the keyboard (no window is
+    /// active); otherwise the key goes on to the window, as typing.
+    fn on_canvas(&mut self, window: &mut Window, cx: &mut Context<Self>, f: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>)) {
+        if self.focus_handle.is_focused(window) {
+            f(self, window, cx);
+        } else {
+            cx.propagate();
+        }
+    }
+
+    fn select_tool(&mut self, _: &SelectTool, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_canvas(window, cx, |this, window, cx| this.set_tool(Tool::Select, window, cx));
+    }
+
+    fn hand_tool(&mut self, _: &HandTool, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_canvas(window, cx, |this, window, cx| this.set_tool(Tool::Hand, window, cx));
+    }
+
+    fn text_tool(&mut self, _: &TextTool, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_canvas(window, cx, |this, window, cx| this.set_tool(Tool::Add(MarkKind::Text), window, cx));
+    }
+
+    fn note_tool(&mut self, _: &NoteTool, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_canvas(window, cx, |this, window, cx| this.set_tool(Tool::Add(MarkKind::Note), window, cx));
+    }
+
+    fn section_tool(&mut self, _: &SectionTool, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_canvas(window, cx, |this, window, cx| this.set_tool(Tool::Add(MarkKind::Section), window, cx));
+    }
+
+    fn delete_selection(&mut self, _: &DeleteSelection, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_canvas(window, cx, |this, _, cx| {
+            if !this.delete_selected_mark(cx) {
+                cx.propagate();
+            }
+        });
+    }
+
+    fn deselect(&mut self, _: &Deselect, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_canvas(window, cx, |this, _, cx| {
+            if this.tool != Tool::Select {
+                this.tool = Tool::Select;
+            } else if this.selected_mark.take().is_none() {
+                cx.propagate();
+            }
+            cx.notify();
+        });
+    }
+
+    /// Lines the windows up in rows.
+    pub fn tidy(&mut self, cx: &mut Context<Self>) {
+        let project = self.project_id;
+        self.store.update(cx, |store, cx| {
+            store.tidy_windows(project);
+            cx.notify();
+        });
+        let frames = self.project(cx).map(|p| p.windows.clone()).unwrap_or_default();
+        if let Some(viewport) = fit(&frames, self.view_size(), 1.) {
+            self.set_viewport(viewport, cx);
+        }
+        cx.notify();
+    }
+
+    /// What the command palette can ask of the canvas.
+    pub fn run(&mut self, command: CanvasCommand, window: &mut Window, cx: &mut Context<Self>) {
+        match command {
+            CanvasCommand::ZoomIn => self.zoom_in(&ZoomIn, window, cx),
+            CanvasCommand::ZoomOut => self.zoom_out(&ZoomOut, window, cx),
+            CanvasCommand::ZoomToActualSize => self.zoom_actual(&ZoomToActualSize, window, cx),
+            CanvasCommand::ZoomToFit => self.zoom_fit(&ZoomToFit, window, cx),
+            CanvasCommand::ZoomToWindow => self.zoom_window(&ZoomToWindow, window, cx),
+            CanvasCommand::Tidy => self.tidy(cx),
+            CanvasCommand::AddMark(kind) => self.add_mark_in_view(kind, window, cx),
+            CanvasCommand::Tool(tool) => self.set_tool(tool, window, cx),
+            CanvasCommand::CloseWindow => self.close_window(&CloseWindow, window, cx),
+            CanvasCommand::NewTerminalBelow => self.add_terminal(true, window, cx),
+        }
+    }
+
+    /// Where a point a window saw (in its own, unzoomed units) is in the
+    /// app window: windows are laid out at 100% from where they're drawn,
+    /// and drawn zoomed around that corner.
+    /// A menu's place in window `item`, in the app window's coordinates.
+    fn menu_on_screen(&self, item: u64, at: MenuAt, cx: &App) -> MenuAt {
+        MenuAt { point: self.on_screen(item, at.point, cx), corner: at.corner }
+    }
+
+    fn on_screen(&self, item: u64, point: Point<Pixels>, cx: &App) -> Point<Pixels> {
+        let Some(frame) = self.project(cx).and_then(|p| p.frame(item)).copied() else {
+            return point;
+        };
+        let viewport = self.viewport(cx);
+        let origin = self.bounds.get().origin
+            + gpui::point(px((frame.x - viewport.x) * viewport.zoom), px((frame.y - viewport.y) * viewport.zoom));
+        origin + (point - origin) * viewport.zoom
+    }
+
+    /// What the footer says about the canvas.
+    pub fn stats(&self, cx: &App) -> CanvasStats {
+        let project = self.project(cx);
+        let running = self
+            .windows
+            .values()
+            .filter(|(content, _)| matches!(content, Content::Terminal(terminal) if terminal.read(cx).running()))
+            .count();
+        let terminals = self.windows.values().filter(|(content, _)| matches!(content, Content::Terminal(_))).count();
+        CanvasStats {
+            windows: project.map_or(0, |p| p.windows.len()),
+            terminals,
+            running,
+            marks: project.map_or(0, |p| p.marks.len()),
+            zoom: self.viewport(cx).zoom,
+            active: self
+                .active
+                .and_then(|id| project?.item(id))
+                .map(|item| (item.kind, item.title.clone())),
+        }
+    }
+
+    /// The open windows, front to back: (id, kind, title).
+    pub fn open_windows(&self, cx: &App) -> Vec<(u64, ItemKind, String)> {
+        let Some(project) = self.project(cx) else {
+            return Vec::new();
+        };
+        project
+            .windows
+            .iter()
+            .rev()
+            .filter_map(|frame| project.item(frame.item))
+            .map(|item| (item.id, item.kind, item.title.clone()))
+            .collect()
+    }
+
     // Window actions -----------------------------------------------------------
 
     fn new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
@@ -1031,6 +1447,14 @@ impl ProjectCanvas {
         let zoom = viewport.zoom;
         let left = (frame.x - viewport.x) * zoom;
         let top = (frame.y - viewport.y) * zoom;
+        let active = self.active == Some(id);
+        // Windows that only react once they're active (terminals check
+        // their focus themselves; a Browser's page only takes the mouse when
+        // active).
+        let covered = matches!(
+            self.windows.get(&id),
+            Some((Content::Explorer(_) | Content::Lino(_) | Content::Git(_), _))
+        );
 
         div()
             .id(ElementId::named_usize("window", id as usize))
@@ -1052,24 +1476,59 @@ impl ProjectCanvas {
                 }),
             )
             .on_drop(cx.listener(move |this, files: &DraggedFiles, window, cx| {
-                this.open_paths(files.0.clone(), Some(id), window, cx)
+                this.drop_on_window(id, files.0.clone(), window, cx)
             }))
             .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
+                // Finder's files are on this Mac: only a project here can use them.
                 if this.server.is_none() {
-                    this.open_paths(paths.paths().to_vec(), Some(id), window, cx)
+                    this.drop_on_window(id, paths.paths().to_vec(), window, cx)
                 }
             }))
-            .child(Scaled {
-                rem: px(16. * zoom),
-                child: self.render_window_contents(item, theme, cx).into_any_element(),
+            // Covers the pages of Browser windows behind it.
+            .child(layers::occluder())
+            .child(Zoomed {
+                size: (frame.width, frame.height),
+                zoom,
+                child: div()
+                    .flex_none()
+                    .w(px(frame.width))
+                    .h(px(frame.height))
+                    .child(self.render_window_contents(item, theme, cx))
+                    .into_any_element(),
+            })
+            // An Explorer, Lino or Git window that isn't active doesn't take
+            // clicks or scrolling: the first click picks the window, and
+            // scrolling over it pans the canvas, as over any other window.
+            // While files are dragged, every window takes drops, active or
+            // not (another explorer, Finder). Outside the zoomed part, so it
+            // gets the pointer in canvas terms.
+            .when(covered && !active && !cx.has_active_drag(), |window| {
+                window.child(
+                    div()
+                        .id(ElementId::named_usize("window-cover", id as usize))
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .top(px(HEADER_HEIGHT * zoom))
+                        .occlude()
+                        .on_scroll_wheel(cx.listener(Self::scroll_wheel))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                this.activate(id, window, cx);
+                                window.prevent_default();
+                            }),
+                        ),
+                )
             })
             .children(Edge::ALL.into_iter().map(|edge| {
                 resize_handle(edge)
                     .id(ElementId::named_usize("resize", id as usize * 8 + edge as usize))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            this.begin_gesture(event.position, Some(id), cx)
+                        cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                            this.begin_gesture(window.mouse_position(), Some(id), cx)
                         }),
                     )
                     .on_drag(ResizeWindow { item: id, edge }, move |_, _, window, cx| {
@@ -1085,10 +1544,16 @@ impl ProjectCanvas {
         let id = item.id;
         let active = self.active == Some(id);
         let content = self.windows.get(&id).map(|(content, _)| content.clone());
+        // A Browser's page only takes the mouse in the active window.
+        if let Some(Content::Browser(browser)) = &content {
+            browser.read(cx).set_active(active);
+        }
         // A command running in a terminal, or lino's live process.
         let running = match &content {
             Some(Content::Terminal(terminal)) => terminal.read(cx).running(),
             Some(Content::Lino(lino)) => lino.read(cx).running(),
+            Some(Content::Browser(browser)) => browser.read(cx).loading(),
+            Some(Content::Sftp(sftp)) => sftp.read(cx).busy(),
             _ => false,
         };
         // What the shell says: its folder at a prompt (shown with ~), or
@@ -1106,16 +1571,16 @@ impl ProjectCanvas {
             Some(Content::Lino(lino)) => lino.read(cx).summary(),
             Some(Content::Editor(editor)) => editor.read(cx).summary(),
             Some(Content::Git(git)) => git.read(cx).summary(),
+            Some(Content::Browser(browser)) => browser.read(cx).summary(),
+            Some(Content::Sftp(sftp)) => sftp.read(cx).summary(cx),
             None => None,
         };
-        // Windows that only react once they're active (terminals check
-        // their focus themselves).
-        let covered = matches!(content, Some(Content::Explorer(_) | Content::Lino(_) | Content::Git(_)));
-        let duplicable = matches!(item.kind, ItemKind::Terminal | ItemKind::Explorer);
+        let duplicable = matches!(item.kind, ItemKind::Terminal | ItemKind::Explorer | ItemKind::Browser);
         let accent = item.color.resolve(&theme.tints, theme.muted_foreground);
 
-        // A window: border bg-background rounded-xl, border-active while
-        // it's the active one.
+        // A window: border bg-background rounded-xl with a soft shadow; the
+        // active one gets the accent's ring and a deeper shadow.
+        let ring = theme.tints.blue.base;
         div()
             .size_full()
             .flex()
@@ -1123,8 +1588,31 @@ impl ProjectCanvas {
             .overflow_hidden()
             .rounded(rems(14. / 16.))
             .border_1()
-            .border_color(if active { theme.border_active } else { theme.border })
+            .border_color(if active { ring.opacity(0.75) } else { theme.border })
             .bg(theme.background)
+            .shadow(if active {
+                vec![
+                    gpui::BoxShadow {
+                        color: ring.opacity(0.22),
+                        offset: point(px(0.), px(0.)),
+                        blur_radius: px(0.),
+                        spread_radius: px(3.),
+                    },
+                    gpui::BoxShadow {
+                        color: gpui::black().opacity(0.22),
+                        offset: point(px(0.), px(14.)),
+                        blur_radius: px(36.),
+                        spread_radius: px(-10.),
+                    },
+                ]
+            } else {
+                vec![gpui::BoxShadow {
+                    color: gpui::black().opacity(0.12),
+                    offset: point(px(0.), px(6.)),
+                    blur_radius: px(20.),
+                    spread_radius: px(-8.),
+                }]
+            })
             .child(
                 // Header (the drag handle): h-8 px-3 gap-2 text-xs, border-b.
                 div()
@@ -1148,8 +1636,8 @@ impl ProjectCanvas {
                     .text_color(theme.muted_foreground)
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            this.begin_gesture(event.position, Some(id), cx)
+                        cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                            this.begin_gesture(window.mouse_position(), Some(id), cx)
                         }),
                     )
                     .on_drag(MoveWindow(id), |_, _, window, cx| {
@@ -1164,11 +1652,8 @@ impl ProjectCanvas {
                     }))
                     .on_mouse_down(
                         MouseButton::Right,
-                        cx.listener(move |_, event: &MouseDownEvent, _, cx| {
-                            cx.emit(CanvasEvent::ItemMenu {
-                                item: id,
-                                position: event.position,
-                            });
+                        cx.listener(move |_, _: &MouseDownEvent, _, cx| {
+                            cx.emit(CanvasEvent::ItemMenu { item: id, at: None });
                         }),
                     )
                     .child(ui::icon(item.kind.icon()).size_3p5().text_color(accent))
@@ -1194,15 +1679,14 @@ impl ProjectCanvas {
                             .children(live_title.map(SharedString::from)),
                     )
                     .child(
-                        header_button(id, "menu", IconName::Ellipsis, theme).on_click(cx.listener(
-                            move |_, event: &gpui::ClickEvent, _, cx| {
+                        header_button(id, "menu", IconName::Ellipsis, theme)
+                            .child(self.anchors.track(format!("window-menu-{id}")))
+                            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                                 cx.stop_propagation();
-                                cx.emit(CanvasEvent::ItemMenu {
-                                    item: id,
-                                    position: event.position(),
-                                });
-                            },
-                        )),
+                                let at = this.anchors.below(&format!("window-menu-{id}"), ui::Align::End, event.position());
+                                let at = this.menu_on_screen(id, at, cx);
+                                cx.emit(CanvasEvent::ItemMenu { item: id, at: Some(at) });
+                            })),
                     )
                     // Terminals and explorers can be duplicated: the copy
                     // opens to the right, in the same folder.
@@ -1234,34 +1718,12 @@ impl ProjectCanvas {
                     // Cached: a window only renders again when it changed
                     // (or moved), so a busy terminal doesn't make every other
                     // window render with it.
-                    .children(content.as_ref().map(|content| {
-                        content.view().cached(gpui::StyleRefinement::default().size_full())
+                    .children(content.as_ref().map(|content| match content {
+                        // Painted every frame: its page (a native view) is
+                        // placed where it paints (see `layers`).
+                        Content::Browser(_) => div().size_full().child(content.view()).into_any_element(),
+                        _ => content.view().cached(gpui::StyleRefinement::default().size_full()).into_any_element(),
                     }))
-                    // An Explorer or Lino window that isn't active doesn't
-                    // take clicks or scrolling: the first click picks the
-                    // window, and scrolling over it pans the canvas, as over
-                    // any other window.
-                    // While files are dragged, every explorer takes drops,
-                    // active or not (another explorer, Finder).
-                    .when(covered && !active && !cx.has_active_drag(), |body| {
-                        body.child(
-                            div()
-                                .id(ElementId::named_usize("window-cover", id as usize))
-                                .absolute()
-                                .top_0()
-                                .left_0()
-                                .size_full()
-                                .occlude()
-                                .on_scroll_wheel(cx.listener(Self::scroll_wheel))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, window, cx| {
-                                        this.activate(id, window, cx);
-                                        window.prevent_default();
-                                    }),
-                                ),
-                        )
-                    }),
             )
     }
 
@@ -1282,9 +1744,16 @@ impl ProjectCanvas {
             .border_color(theme.border)
             .bg(theme.popover)
             .text_color(theme.popover_foreground)
+            .shadow(vec![gpui::BoxShadow {
+                color: gpui::black().opacity(0.12),
+                offset: point(px(0.), px(6.)),
+                blur_radius: px(18.),
+                spread_radius: px(-4.),
+            }])
             .block_mouse_except_scroll()
             // Zooming leaves the keyboard where it was.
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+            .child(layers::occluder())
             .child(
                 ui::small_icon_button("zoom-out", IconName::Minus, theme)
                     .on_click(cx.listener(|this, _, window, cx| this.zoom_out(&ZoomOut, window, cx))),
@@ -1336,7 +1805,7 @@ impl ProjectCanvas {
                     .text_size(px(16.))
                     .line_height(px(24.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("No windows open"),
+                    .child(t("Nothing here yet")),
             )
             .child(
                 div()
@@ -1346,14 +1815,14 @@ impl ProjectCanvas {
                     .line_height(px(20.))
                     .text_color(theme.muted_foreground)
                     .child(if closed {
-                        "Reopen a window from the sidebar, or start a new terminal."
+                        t("Reopen a window from the sidebar, start a terminal, or mark the canvas up with the tools below.")
                     } else {
-                        "Windows sit anywhere on this canvas. Drag empty space to pan, ⌘-scroll to zoom."
+                        t("Windows, notes and sections sit anywhere on this canvas. Drag empty space to pan, ⌘-scroll or pinch to zoom.")
                     }),
             )
             .child(
                 div().mt_3().child(
-                    Button::new("empty-new-terminal", "New terminal")
+                    Button::new("empty-new-terminal", t("New terminal"))
                         .icon(IconName::Plus)
                         .on_click(cx.listener(|this, _, window, cx| this.add_terminal(false, window, cx))),
                 ),
@@ -1362,7 +1831,7 @@ impl ProjectCanvas {
 }
 
 impl Render for ProjectCanvas {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::global(cx);
         let Some(project) = self.project(cx) else {
             return div().into_any_element();
@@ -1370,7 +1839,9 @@ impl Render for ProjectCanvas {
         let viewport = project.viewport;
         let bounds = self.bounds.clone();
         let dot_color = theme.border;
+        let dots = Settings::get(cx).dot_grid;
         let (view_w, view_h) = self.view_size();
+        let tool = self.tool;
 
         // Windows outside the view aren't drawn (their sessions keep
         // running). The active one always is, so it keeps the keyboard.
@@ -1398,6 +1869,13 @@ impl Render for ProjectCanvas {
             .on_action(cx.listener(Self::zoom_actual))
             .on_action(cx.listener(Self::zoom_fit))
             .on_action(cx.listener(Self::zoom_window))
+            .on_action(cx.listener(Self::select_tool))
+            .on_action(cx.listener(Self::hand_tool))
+            .on_action(cx.listener(Self::text_tool))
+            .on_action(cx.listener(Self::note_tool))
+            .on_action(cx.listener(Self::section_tool))
+            .on_action(cx.listener(Self::delete_selection))
+            .on_action(cx.listener(Self::deselect))
             .relative()
             .size_full()
             .overflow_hidden()
@@ -1414,6 +1892,23 @@ impl Render for ProjectCanvas {
             .on_drag_move(cx.listener(|this, event: &DragMoveEvent<PanCanvas>, _, cx| {
                 this.drag_pan(event.event.position, cx);
             }))
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<MoveMark>, _, cx| {
+                let mark = event.drag(cx).0;
+                this.drag_mark(mark, None, event.event.position, cx);
+            }))
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<ResizeMark>, _, cx| {
+                let (mark, edge) = event.drag(cx).target();
+                this.drag_mark(mark, Some(edge), event.event.position, cx);
+            }))
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<DrawSection>, _, cx| {
+                if let Some((_, to)) = &mut this.drawing {
+                    *to = event.event.position;
+                    cx.notify();
+                }
+            }))
+            // Ends a section being drawn, and mark drags, wherever the
+            // pointer is let go.
+            .capture_any_mouse_up(cx.listener(Self::mouse_released))
             .child(
                 // Empty canvas: a dot grid that pans when dragged.
                 div()
@@ -1422,22 +1917,42 @@ impl Render for ProjectCanvas {
                     .top_0()
                     .left_0()
                     .size_full()
+                    .when(matches!(tool, Tool::Add(_)), |el| el.cursor(CursorStyle::Crosshair))
+                    .when(tool == Tool::Hand, |el| el.cursor(CursorStyle::OpenHand))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                            this.begin_gesture(event.position, None, cx);
+                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                            this.finish_editing(cx);
+                            this.selected_mark = None;
                             // Clicking empty canvas lets go of every window,
                             // as in Figma: none is active or takes typing.
                             // The canvas keeps the keyboard, for ⌘T and zoom.
                             this.active = None;
                             window.focus(&this.focus_handle);
                             window.prevent_default();
+                            match this.tool {
+                                Tool::Add(kind) => this.press_with_tool(kind, window, cx),
+                                Tool::Select | Tool::Hand => this.begin_gesture(window.mouse_position(), None, cx),
+                            }
                             cx.notify();
                         }),
                     )
-                    .on_drag(PanCanvas, |_, _, window, cx| {
-                        cx.set_active_drag_cursor_style(CursorStyle::ClosedHand, window);
-                        cx.new(|_| NoPreview)
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, _: &MouseDownEvent, window, cx| this.open_canvas_menu(window, cx)),
+                    )
+                    .map(|el| {
+                        if tool == Tool::Add(MarkKind::Section) {
+                            el.on_drag(DrawSection, |_, _, window, cx| {
+                                cx.set_active_drag_cursor_style(CursorStyle::Crosshair, window);
+                                cx.new(|_| NoPreview)
+                            })
+                        } else {
+                            el.on_drag(PanCanvas, |_, _, window, cx| {
+                                cx.set_active_drag_cursor_style(CursorStyle::ClosedHand, window);
+                                cx.new(|_| NoPreview)
+                            })
+                        }
                     })
                     // Files dropped on empty canvas open where they land.
                     .on_drop(cx.listener(|this, files: &DraggedFiles, window, cx| {
@@ -1451,11 +1966,17 @@ impl Render for ProjectCanvas {
                     .child(
                         canvas(
                             move |view, _, _| bounds.set(view),
-                            move |view, _, window, _| paint_dots(view, viewport, dot_color, window),
+                            move |view, _, window, _| {
+                                if dots {
+                                    paint_dots(view, viewport, dot_color, window)
+                                }
+                            },
                         )
                         .size_full(),
                     ),
             )
+            // Sections, behind the windows.
+            .children(self.render_sections(project, viewport, theme, window, cx))
             .children(
                 project
                     .windows
@@ -1466,9 +1987,48 @@ impl Render for ProjectCanvas {
                         Some(self.render_window(frame, item, viewport, theme, cx))
                     }),
             )
-            .when(project.windows.is_empty(), |canvas| {
+            // Text and notes, in front of them.
+            .children(self.render_front_marks(project, viewport, theme, window, cx))
+            .children(self.render_selection(project, viewport, theme, window, cx))
+            .children(self.render_drawing(theme))
+            // The hand tool pans from anywhere, over windows too.
+            .when(tool == Tool::Hand, |canvas| {
+                canvas.child(
+                    div()
+                        .id("hand-tool")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .occlude()
+                        .cursor(CursorStyle::OpenHand)
+                        .on_scroll_wheel(cx.listener(Self::scroll_wheel))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                window.prevent_default();
+                                this.begin_gesture(window.mouse_position(), None, cx)
+                            }),
+                        )
+                        .on_drag(PanCanvas, |_, _, window, cx| {
+                            cx.set_active_drag_cursor_style(CursorStyle::ClosedHand, window);
+                            cx.new(|_| NoPreview)
+                        }),
+                )
+            })
+            .when(project.windows.is_empty() && project.marks.is_empty(), |canvas| {
                 canvas.child(self.render_empty(project, theme, cx))
             })
+            .child(
+                div()
+                    .absolute()
+                    .bottom(px(12.))
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .child(self.render_toolbar(theme, cx).relative()),
+            )
             .child(self.render_zoom_controls(viewport.zoom, theme, cx))
             .into_any_element()
     }

@@ -57,6 +57,12 @@ const WINDOW_STATE_IVAR: &str = "windowState";
 static mut WINDOW_CLASS: *const Class = ptr::null();
 static mut PANEL_CLASS: *const Class = ptr::null();
 static mut VIEW_CLASS: *const Class = ptr::null();
+
+/// xharness: GPUI's view class, to tell its views from others (see
+/// `native_view_under_mouse` in platform.rs).
+pub(crate) fn view_class() -> *const Class {
+    unsafe { VIEW_CLASS }
+}
 static mut BLURRED_VIEW_CLASS: *const Class = ptr::null();
 
 #[allow(non_upper_case_globals)]

@@ -257,8 +257,8 @@ impl IndentStyle {
 
     pub(super) fn label(self) -> String {
         match self {
-            IndentStyle::Tabs => "Tabs".to_string(),
-            IndentStyle::Spaces(n) => format!("Spaces: {n}"),
+            IndentStyle::Tabs => t("Tabs").to_string(),
+            IndentStyle::Spaces(n) => tf("Spaces: {}", &[&n]),
         }
     }
 }

@@ -91,13 +91,9 @@ impl Lino {
 
     /// Runs `lino <args> --json` in `folder` and reads its reply.
     fn call<T: DeserializeOwned>(&self, folder: &Path, args: &[&str]) -> Result<Reply<T>, String> {
-        let output = crate::services::command(&self.path)
-            .args(args)
-            .arg("--json")
-            .current_dir(folder)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|error| format!("can't run lino: {error}"))?;
+        let mut command = crate::services::command(&self.path);
+        command.args(args).arg("--json").current_dir(folder).stdin(Stdio::null());
+        let output = run_unless_busy(&mut command).map_err(|error| format!("can't run lino: {error}"))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         // One JSON object; anything else printed before it is a note.
         serde_json::from_str(&stdout)
@@ -250,6 +246,25 @@ fn install(dir: &Path, bundle: &Bundle) -> io::Result<PathBuf> {
         fs::rename(&temp, &path)?;
     }
     Ok(dir.join("lino"))
+}
+
+/// Runs `command`, trying again for a moment while its file is "busy".
+///
+/// Right after [`install`] writes lino, a process another thread is
+/// starting (a shell, git) can still hold the file open for writing: forked
+/// before the write finished, it keeps the descriptor until it execs. Linux
+/// refuses to run a file open for writing (ETXTBSY) until then.
+fn run_unless_busy(command: &mut std::process::Command) -> io::Result<std::process::Output> {
+    let mut tries = 0;
+    loop {
+        match command.output() {
+            Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy && tries < 50 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
 }
 
 /// `lino` on `PATH`, if any.

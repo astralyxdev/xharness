@@ -640,22 +640,36 @@ impl Host {
         let pump = session.clone();
         thread::spawn(move || {
             pump.pump(output);
-            host.remove(&pump.id);
+            host.remove_ended(&pump);
         });
         Ok((session, true))
     }
 
-    fn remove(&self, id: &str) {
-        let session = self.sessions.lock().unwrap().remove(id);
-        // Dropping the PTY hangs up on the shell and reaps it. Outside the
-        // sessions lock: that can take a moment.
-        if let Some(session) = session {
-            session.pty.lock().unwrap().take();
-        }
+    /// Forgets a session whose shell ended, unless it's gone already. By
+    /// then a new session may have the same name (killed, then opened
+    /// again: on Windows the old output only ends once its console has
+    /// closed), and that one stays.
+    fn remove_ended(&self, ended: &Arc<HostSession>) {
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = match sessions.get(&ended.id) {
+            Some(current) if Arc::ptr_eq(current, ended) => sessions.remove(&ended.id),
+            _ => None,
+        };
+        drop(sessions);
+        Self::hang_up(session);
     }
 
     fn kill(&self, id: &str) {
-        self.remove(id);
+        let session = self.sessions.lock().unwrap().remove(id);
+        Self::hang_up(session);
+    }
+
+    /// Dropping the PTY hangs up on the shell and reaps it. Outside the
+    /// sessions lock: that can take a moment.
+    fn hang_up(session: Option<Arc<HostSession>>) {
+        if let Some(session) = session {
+            session.pty.lock().unwrap().take();
+        }
     }
 
     fn exit_when_idle(&self, idle: Duration, socket: &Path) {
@@ -904,6 +918,29 @@ pub mod tests {
         let show = shell_command("echo state-$XH_STATE\r", "echo \"state-$env:XH_STATE\"\r");
         write_frame(&mut second, frame::INPUT, show).unwrap();
         read_until(&mut second, "state-kept-42");
+    }
+
+    /// A killed session's output can end after a new one took its name;
+    /// the new one stays.
+    #[test]
+    fn an_old_session_ending_leaves_its_successor() {
+        let host = Host::default();
+        let session = || {
+            Arc::new(HostSession {
+                id: "again".into(),
+                pty: Mutex::new(None),
+                input: Mutex::new(Box::new(io::sink())),
+                state: Mutex::new(SessionState::default()),
+            })
+        };
+        let (old, new) = (session(), session());
+        host.sessions.lock().unwrap().insert("again".into(), old.clone());
+        host.kill("again");
+        host.sessions.lock().unwrap().insert("again".into(), new.clone());
+        host.remove_ended(&old);
+        assert!(Arc::ptr_eq(&host.sessions.lock().unwrap()["again"], &new));
+        host.remove_ended(&new);
+        assert!(host.sessions.lock().unwrap().is_empty());
     }
 
     #[test]

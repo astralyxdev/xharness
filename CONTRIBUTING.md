@@ -42,7 +42,7 @@ cargo test --no-default-features    # the server on its own, as remote servers r
   works on remote projects too. Note anything that only works locally.
 - UI changes: add before/after screenshots.
 - CI runs on every pull request (`.github/workflows/ci.yml`): the macOS app,
-  the Linux server, and the Windows app must pass.
+  the Linux server, the Windows app and the Linux app must pass.
 
 ## Reporting problems
 

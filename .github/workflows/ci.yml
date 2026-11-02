@@ -1,10 +1,10 @@
 # Builds and tests every push to main and every pull request.
 #
 # Required: the macOS app, the server on Linux (tests, and the static
-# x64/arm64 builds), and the Windows app (cross-built with MinGW, as
-# scripts/build/windows.sh does). Experimental, not blocking yet: the Linux
-# app and a native Windows build with its tests, which haven't passed
-# anywhere yet. Drop their `continue-on-error` once they're green.
+# x64/arm64 builds), the Windows app (cross-built with MinGW, as
+# scripts/build/windows.sh does) and the Linux app. Experimental, not
+# blocking yet: a native Windows build with its tests, which haven't all
+# passed yet. Drop its `continue-on-error` once it's green.
 
 name: CI
 
@@ -87,10 +87,9 @@ jobs:
           retention-days: 7
 
   linux:
-    name: Linux app (experimental)
+    name: Linux app
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7

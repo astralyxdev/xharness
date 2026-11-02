@@ -176,8 +176,9 @@ included. Three ways:
 
 Every push to `main` and every pull request runs `.github/workflows/ci.yml`:
 the macOS app (build and tests), the server on Linux (tests and the static
-x64/arm64 builds), and the Windows app (cross-built). The Linux app and a
-native Windows build run too, as experiments that don't block yet.
+x64/arm64 builds), the Windows app (cross-built) and the Linux app (build
+and tests). A native Windows build with its tests runs too, as an experiment
+that doesn't block yet.
 
 Pushing a tag `v<version>` (matching `Cargo.toml`) runs
 `.github/workflows/release.yml`, which builds every package and drafts a GitHub
